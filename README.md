@@ -1,6 +1,6 @@
 # FBX Viewer
 
-区間再生可能なブラウザ向けFBXアニメーションビューア。
+ブラウザ向けFBXアニメーションビューア。
 
 https://imaoki.github.io/fbx-viewer/
 
