@@ -1619,7 +1619,7 @@ Googleのmotion_modeを黒地に載せたもの。線画のままだと明るい
         <button class="icon-cycle on" id="playModeBtn" title="Continuous loop" aria-label="Playback mode">
           <span class="ms">repeat</span></button>
         <label class="icon-check" title="Toggle Snap — whole frames instead of real time">
-          <input type="checkbox" id="snapToggle"><span class="ms">floor</span></label>
+          <input type="checkbox" id="snapToggle" checked><span class="ms">floor</span></label>
       </div>
 
       <div class="tgroup tgroup-center">
@@ -1866,7 +1866,7 @@ watchIconFont();
 // -----------------------------------------------------------------------------
 
 /*- @var <string> アプリのバージョン（semver）。ここが唯一の出所。 */
-const APP_VERSION = "1.69.0";
+const APP_VERSION = "1.70.0";
 const APP_NAME = "FBX Viewer";
 document.getElementById("appVersion").textContent = APP_VERSION;
 document.getElementById("helpVersion").textContent = APP_VERSION;
@@ -1892,7 +1892,8 @@ let gateWidthPx = null; // 解像度ゲートの幅。隠しているときはnu
 let focalCurves = new Map(); // カメラ名→キー付きの焦点距離。
 let rollCurves = new Map(); // カメラ名→キー付きのロール（度）。
 let fbxSettings = null; // fpsと単位の判定結果。表示用。
-let frameSnap = false; // 再生を整数フレームに量子化する。
+// 再生を整数フレームに量子化する。既定値の出所はマークアップなので、JS側に書かず読み取る。
+let frameSnap = document.getElementById("snapToggle").checked;
 let debugTick = 0;
 
 const scene = new THREE.Scene();
