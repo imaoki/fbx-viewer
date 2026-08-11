@@ -1866,7 +1866,7 @@ watchIconFont();
 // -----------------------------------------------------------------------------
 
 /*- @var <string> アプリのバージョン（semver）。ここが唯一の出所。 */
-const APP_VERSION = "1.68.1";
+const APP_VERSION = "1.68.2";
 const APP_NAME = "FBX Viewer";
 document.getElementById("appVersion").textContent = APP_VERSION;
 document.getElementById("helpVersion").textContent = APP_VERSION;
@@ -3533,6 +3533,10 @@ function onModelLoaded(obj, name) {
   applySkeletonColors();
 
   animations = model.animations || [];
+  const retimed = repairTrackTimes(animations);
+  if (retimed) {
+    console.info(`[load] resorted key times on ${retimed} track(s) that ran backwards`);
+  }
   applyRotationPivots(fbxNodeExtras.pivots);
   attachCameraAimTargets(fbxNodeExtras.cameraAim);
   setupTakes();
@@ -3553,64 +3557,58 @@ function onModelLoaded(obj, name) {
   document.getElementById("dropHint").style.display = "none";
 
   fillFileInfo(name, vertexCount, boneNames.size);
-  logCameraTrackDiag(); // DIAG 一時的な診断。原因を掴んだら消す。
 }
 
 /*-
-DIAG 一時的な診断。
-FBXカメラのノードに結び付いたトラックのキーの並びと、読み込み直後にノードが実際に持っている値を報告する。
-位置と回転が別々のトラックである以上、両者の並びが食い違えば同じ時刻でも違うフレームを指し得る。
-それが起きているかどうかを見る。
+FBXLoaderが組んだキーフレームトラックの時刻を、必ず前へ進む並びに直す。
+
+three.jsの補間器は時刻が昇順であることを前提に二分探索を行うので、途中で時刻が戻る配列を渡すと見当違いの区間に着く。
+症状は「最初の評価だけ1つ手前のキーを返し、何度か評価するうちに正しい位置へ歩いていく」という形になる。
+読み込んだ直後だけカメラの向きが1フレーム古い、という不具合はこれだった。
+位置と回転は別のトラックなので、片方だけ崩れると同じ時刻でも違うフレームを指す。
+
+崩れるのは`interpolateRotations()`が180度を超える回転の区間へ中間キーを挿し込む経路で、挿し込んだ時刻が元のキーを追い越すことがある。
+時刻と値を組にしたまま並べ替えれば、キーそのものを捨てずに済む。
+時刻が重なったものだけは落とす。区間の長さが0になり、補間の割り算がNaNを生むため。
+@param clips <Array[<THREE.AnimationClip>]> 読み込んだクリップ。その場で直す。
+@returns <number> 直したトラックの数。
 */
-function logCameraTrackDiag() {
-  if (!clip || !fbxCameras.length) return;
-  const src = fbxCameras[0];
-  const nm = src.name;
-  const f = (v) => Number(v).toFixed(4);
-  console.log(
-    `[diag] clip "${clip.name}" duration=${clip.duration} tracks=${clip.tracks.length}`
-        + ` fps=${state.fps} playhead=${playhead}`
-  );
-  console.log(
-    `[diag] node "${nm}" pos=(${src.position.toArray().map(f).join(", ")})`
-        + ` quat=(${src.quaternion.toArray().map(f).join(", ")})`
-  );
-  clip.tracks
-    .filter((t) => t.name.indexOf(`${nm}.`) === 0)
-    .forEach((t) => {
-      const keys = t.times.length;
-      const stride = t.values.length / keys;
-      const times = Array.from(t.times);
-      const back = []; // 前のキーより手前に戻っている位置。
-      const offGrid = []; // フレームの格子に乗っていない位置。
-      times.forEach((v, i) => {
-        if (i > 0 && v <= times[i - 1]) back.push(i);
-        const fr = v * state.fps;
-        if (Math.abs(fr - Math.round(fr)) > 1e-3) offGrid.push(`${i}:${fr.toFixed(4)}`);
+function repairTrackTimes(clips) {
+  let fixed = 0;
+  clips.forEach((clip) => {
+    clip.tracks.forEach((track) => {
+      const times = track.times;
+      const keys = times.length;
+      let ordered = true;
+      for (let i = 1; i < keys; i++) {
+        if (times[i] <= times[i - 1]) { ordered = false; break; }
+      }
+      if (ordered) return; // 正常なトラックは元のまま渡す。
+
+      const values = track.values;
+      const stride = values.length / keys;
+      const order = [];
+      for (let i = 0; i < keys; i++) order.push(i);
+      // 並べ替えは安定なので、同じ時刻のキーは元の順序を保ったまま並ぶ。
+      order.sort((a, b) => times[a] - times[b]);
+      const keep = order.filter((src, i) => i === 0 || times[src] > times[order[i - 1]]);
+
+      const newTimes = new times.constructor(keep.length);
+      const newValues = new values.constructor(keep.length * stride);
+      keep.forEach((src, dst) => {
+        newTimes[dst] = times[src];
+        for (let c = 0; c < stride; c++) {
+          newValues[dst * stride + c] = values[src * stride + c];
+        }
       });
-      console.log(
-        `[diag] ${t.name} keys=${keys} stride=${stride}`
-            + ` t[0]=${t.times[0]} t[last]=${t.times[keys - 1]}`
-            + ` back=${back.length} offGrid=${offGrid.length}`
-      );
-      console.log(
-        `[diag]   back=${back.slice(0, 8).join(",") || "(none)"}`
-            + ` offGrid=${offGrid.slice(0, 8).join(" ") || "(none)"}`
-      );
-      /*
-      トラックから直接補間器を作って評価する。
-      ミキサーを通さない値なので、ノードに入っている値と食い違えば原因はミキサー側にある。
-      */
-      const fresh = t.createInterpolant();
-      console.log(
-        `[diag]   fresh@0=(${Array.from(fresh.evaluate(0)).map(f).join(", ")})`
-      );
-      const walked = t.createInterpolant();
-      [0, 1, 2, 3].forEach((n) => walked.evaluate(n / state.fps));
-      console.log(
-        `[diag]   after 0-3f then @0=(${Array.from(walked.evaluate(0)).map(f).join(", ")})`
-      );
+      track.times = newTimes;
+      track.values = newValues;
+      fixed++;
     });
+    // 末尾が最大とは限らなかったので、長さを取り直す。
+    if (fixed) clip.resetDuration();
+  });
+  return fixed;
 }
 
 /*-
