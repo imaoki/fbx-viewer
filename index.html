@@ -1866,7 +1866,7 @@ watchIconFont();
 // -----------------------------------------------------------------------------
 
 /*- @var <string> アプリのバージョン（semver）。ここが唯一の出所。 */
-const APP_VERSION = "1.68.0";
+const APP_VERSION = "1.68.1";
 const APP_NAME = "FBX Viewer";
 document.getElementById("appVersion").textContent = APP_VERSION;
 document.getElementById("helpVersion").textContent = APP_VERSION;
@@ -2703,6 +2703,14 @@ function parseCameraAttrsAscii(text) {
       const hit = blk.match(new RegExp(`"${key}"[^,]*,[^,]*,[^,]*,[^,]*,(${FBX_NUM})`));
       return hit ? parseFloat(hit[1]) : null;
     };
+    /*
+    ベクトル値のプロパティ。数値が3つ並ぶ点だけがnumと違う。
+    */
+    const vec = (key) => {
+      const hit = blk.match(new RegExp(
+        `"${key}"[^,]*,[^,]*,[^,]*,[^,]*,(${FBX_NUM}),(${FBX_NUM}),(${FBX_NUM})`));
+      return hit ? [parseFloat(hit[1]), parseFloat(hit[2]), parseFloat(hit[3])] : null;
+    };
     out.set(Number(m[1]), {
       focalLength: num("FocalLength"),
       fieldOfView: num("FieldOfView"),
@@ -2712,7 +2720,9 @@ function parseCameraAttrsAscii(text) {
       apertureMode: num("ApertureMode"),
       gateFit: num("GateFit"),
       aspectWidth: num("AspectWidth"),
-      aspectHeight: num("AspectHeight")
+      aspectHeight: num("AspectHeight"),
+      position: vec("Position"),
+      interestPosition: vec("InterestPosition")
     });
   }
   return out;
@@ -2865,7 +2875,8 @@ function parseExtrasBinary(buffer) {
         if (props[2] === "Camera") {
           const attrs = {
             focalLength: null, fieldOfView: null, roll: null, filmWidth: null, filmHeight: null,
-            apertureMode: null, gateFit: null, aspectWidth: null, aspectHeight: null
+            apertureMode: null, gateFit: null, aspectWidth: null, aspectHeight: null,
+            position: null, interestPosition: null
           };
           (function scan(cs, ce) {
             let q0 = cs;
@@ -2883,6 +2894,8 @@ function parseExtrasBinary(buffer) {
                 const pr = readProps(q, np);
                 const key = pr[0];
                 const val = Number(pr[4]);
+                // ベクトル値は3つの数値が続けて置かれている。
+                const vec = () => [Number(pr[4]), Number(pr[5]), Number(pr[6])];
                 if (key === "FocalLength") attrs.focalLength = val;
                 else if (key === "FieldOfView") attrs.fieldOfView = val;
                 else if (key === "Roll") attrs.roll = val;
@@ -2892,6 +2905,8 @@ function parseExtrasBinary(buffer) {
                 else if (key === "GateFit") attrs.gateFit = val;
                 else if (key === "AspectWidth") attrs.aspectWidth = val;
                 else if (key === "AspectHeight") attrs.aspectHeight = val;
+                else if (key === "Position") attrs.position = vec();
+                else if (key === "InterestPosition") attrs.interestPosition = vec();
               }
               q0 = eo;
             }
@@ -3538,6 +3553,64 @@ function onModelLoaded(obj, name) {
   document.getElementById("dropHint").style.display = "none";
 
   fillFileInfo(name, vertexCount, boneNames.size);
+  logCameraTrackDiag(); // DIAG 一時的な診断。原因を掴んだら消す。
+}
+
+/*-
+DIAG 一時的な診断。
+FBXカメラのノードに結び付いたトラックのキーの並びと、読み込み直後にノードが実際に持っている値を報告する。
+位置と回転が別々のトラックである以上、両者の並びが食い違えば同じ時刻でも違うフレームを指し得る。
+それが起きているかどうかを見る。
+*/
+function logCameraTrackDiag() {
+  if (!clip || !fbxCameras.length) return;
+  const src = fbxCameras[0];
+  const nm = src.name;
+  const f = (v) => Number(v).toFixed(4);
+  console.log(
+    `[diag] clip "${clip.name}" duration=${clip.duration} tracks=${clip.tracks.length}`
+        + ` fps=${state.fps} playhead=${playhead}`
+  );
+  console.log(
+    `[diag] node "${nm}" pos=(${src.position.toArray().map(f).join(", ")})`
+        + ` quat=(${src.quaternion.toArray().map(f).join(", ")})`
+  );
+  clip.tracks
+    .filter((t) => t.name.indexOf(`${nm}.`) === 0)
+    .forEach((t) => {
+      const keys = t.times.length;
+      const stride = t.values.length / keys;
+      const times = Array.from(t.times);
+      const back = []; // 前のキーより手前に戻っている位置。
+      const offGrid = []; // フレームの格子に乗っていない位置。
+      times.forEach((v, i) => {
+        if (i > 0 && v <= times[i - 1]) back.push(i);
+        const fr = v * state.fps;
+        if (Math.abs(fr - Math.round(fr)) > 1e-3) offGrid.push(`${i}:${fr.toFixed(4)}`);
+      });
+      console.log(
+        `[diag] ${t.name} keys=${keys} stride=${stride}`
+            + ` t[0]=${t.times[0]} t[last]=${t.times[keys - 1]}`
+            + ` back=${back.length} offGrid=${offGrid.length}`
+      );
+      console.log(
+        `[diag]   back=${back.slice(0, 8).join(",") || "(none)"}`
+            + ` offGrid=${offGrid.slice(0, 8).join(" ") || "(none)"}`
+      );
+      /*
+      トラックから直接補間器を作って評価する。
+      ミキサーを通さない値なので、ノードに入っている値と食い違えば原因はミキサー側にある。
+      */
+      const fresh = t.createInterpolant();
+      console.log(
+        `[diag]   fresh@0=(${Array.from(fresh.evaluate(0)).map(f).join(", ")})`
+      );
+      const walked = t.createInterpolant();
+      [0, 1, 2, 3].forEach((n) => walked.evaluate(n / state.fps));
+      console.log(
+        `[diag]   after 0-3f then @0=(${Array.from(walked.evaluate(0)).map(f).join(", ")})`
+      );
+    });
 }
 
 /*-
@@ -4694,6 +4767,12 @@ function buildFBXCameraRigs() {
     rig.userData.attrs = attrs
         ? { ...attrs, focalLengthBase: attrs.focalLength }
         : null;
+    /*
+    エイム規約の判定に使う、まだ誰も動かしていない姿勢。
+    カメラ属性のPositionとInterestPositionは書き出したフレームの値なので、突き合わせる姿勢も同じフレームでなければならない。
+    ここはミキサーが作られる前なので、ノードは書き出された変換をそのまま持っている。
+    */
+    rig.userData.staticQuat = src.getWorldQuaternion(new THREE.Quaternion());
     src.add(rig);
     return rig;
   });
@@ -4716,13 +4795,58 @@ function applyCameraAim() {
   updateCameraRoll();
 }
 
+/*- @var <Array[<number>]> エイム規約の候補。FBXの+X（-PI/2）と補正無し（0）。 */
+const AIM_OFFSETS = [0, -Math.PI / 2];
+
+/*-
+ファイル自身が書いた視線から、1つのリグのY補正を選ぶ。
+カメラ属性のPositionとInterestPositionは、書き出したフレームでカメラがどこを向いていたかをそのまま与える。
+推定ではなく実測なので、これが取れるならモデルの中心を使った推定より確かで、しかもモデルの範囲にも今のポーズにも左右されない。
+突き合わせるのはリグの静的な姿勢。
+再生位置の姿勢を使うと、その時点のポーズが狂っていた場合に規約の選択まで巻き添えになる。
+@param rig <Object> FBXのカメラに親子付けしたレンダリング用カメラ。
+@returns <number|null> Y回転（ラジアン）。判断材料が無ければ`null`。
+*/
+function aimOffsetFromFile(rig) {
+  const a = rig.userData.attrs;
+  const base = rig.userData.staticQuat;
+  if (!a || !base || !a.position || !a.interestPosition) return null;
+  const look = new THREE.Vector3().fromArray(a.interestPosition)
+    .sub(new THREE.Vector3().fromArray(a.position));
+  if (!isFinite(look.lengthSq()) || look.lengthSq() < 1e-12) return null;
+  look.normalize();
+
+  const quat = new THREE.Quaternion();
+  const spin = new THREE.Quaternion();
+  const axis = new THREE.Vector3(0, 1, 0);
+  const dir = new THREE.Vector3();
+  let best = null;
+  let bestDot = -Infinity;
+
+  AIM_OFFSETS.forEach((angle) => {
+    quat.copy(base).multiply(spin.setFromAxisAngle(axis, angle));
+    dir.set(0, 0, -1).applyQuaternion(quat);
+    const dot = dir.dot(look); // 1がファイルの視線に一致している状態。
+    if (dot > bestDot) { bestDot = dot; best = angle; }
+  });
+  console.log(
+    `[camera] "${rig.name}" aim axis read from file: ${best === 0 ? "-Z" : "+X"}`
+        + ` (${bestDot.toFixed(4)})`
+  );
+  return best;
+}
+
 /*-
 どちらの候補がモデルの中心により近く向くかを試して、1つのリグのY補正を決める。
+ファイルが視線を書いていない場合の推定で、そちらが読めるならこれは使わない。
 @param rig <Object> FBXのカメラに親子付けしたレンダリング用カメラ。
 @returns <number> Y回転（ラジアン）。`0`または-PI/2。
 */
 function chooseAimOffset(rig) {
-  const candidates = [0, -Math.PI / 2];
+  const byFile = aimOffsetFromFile(rig);
+  if (byFile !== null) return byFile;
+
+  const candidates = AIM_OFFSETS;
   const pos = new THREE.Vector3();
   const quat = new THREE.Quaternion();
   const dir = new THREE.Vector3();
