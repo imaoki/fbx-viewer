@@ -1,4 +1,7 @@
 \!*
 tags/
 *.fbx
+*.ma
+*.max
+*.mb
 HANDOVER.md
