@@ -1866,7 +1866,7 @@ watchIconFont();
 // -----------------------------------------------------------------------------
 
 /*- @var <string> アプリのバージョン（semver）。ここが唯一の出所。 */
-const APP_VERSION = "1.68.2";
+const APP_VERSION = "1.69.0";
 const APP_NAME = "FBX Viewer";
 document.getElementById("appVersion").textContent = APP_VERSION;
 document.getElementById("helpVersion").textContent = APP_VERSION;
@@ -2270,8 +2270,10 @@ let animations = []; // AnimationClip[]
 let mixer = null;
 let action = null;
 let clip = null;
+let clipStarts = new Map(); // AnimationClip→ずらす前の先頭のキーの時刻（秒）。
+let clipStartTime = 0; // 有効なクリップの先頭のキーの時刻（秒）。負のフレームから始まるファイルで負になる。
 
-let playhead = 0; // 秒。
+let playhead = 0; // 秒。ファイル上の時刻で、負にもなる。
 let playing = false;
 let shadingMode = "textured";
 let currentView = "persp";
@@ -3483,6 +3485,19 @@ function loadFBX(buffer, name) {
   fbxSettings = s;
   if (s.fps) setFPS(s.fps);
   if (s.metersToUnits) metersToUnits = s.metersToUnits;
+  /*
+  時刻の補正はバイナリだけ。アスキーは数値が文字列で書かれているのでずれない。
+  fpsを決めた後に呼ぶ。0付近の見分けにフレームの格子を使うため。
+  */
+  if (isBinaryFBX(new Uint8Array(buffer))) {
+    const fixed = repairNegativeKeyTimes(obj.animations || [], state.fps);
+    if (fixed.tracks) {
+      console.info(
+        `[load] restored ${fixed.keys} negative key time(s)`
+            + ` on ${fixed.tracks} track(s) misread by 2^32`
+      );
+    }
+  }
   rebuildGrid();
   try {
     onModelLoaded(obj, name);
@@ -3533,10 +3548,7 @@ function onModelLoaded(obj, name) {
   applySkeletonColors();
 
   animations = model.animations || [];
-  const retimed = repairTrackTimes(animations);
-  if (retimed) {
-    console.info(`[load] resorted key times on ${retimed} track(s) that ran backwards`);
-  }
+  clipStarts = alignClipsToStart(animations);
   applyRotationPivots(fbxNodeExtras.pivots);
   attachCameraAimTargets(fbxNodeExtras.cameraAim);
   setupTakes();
@@ -3559,56 +3571,144 @@ function onModelLoaded(obj, name) {
   fillFileInfo(name, vertexCount, boneNames.size);
 }
 
+/*- @var <number> FBXの時間の刻み。1秒あたりの単位数。 */
+const FBX_KTIME = 46186158000;
+
+/*- @var <number> 32ビットの桁上がり分の時間（秒）。バイナリの負の時刻はこれだけ後ろへずれて読まれる。 */
+const FBX_INT32_SECONDS = 4294967296 / FBX_KTIME;
+
 /*-
-FBXLoaderが組んだキーフレームトラックの時刻を、必ず前へ進む並びに直す。
-
-three.jsの補間器は時刻が昇順であることを前提に二分探索を行うので、途中で時刻が戻る配列を渡すと見当違いの区間に着く。
-症状は「最初の評価だけ1つ手前のキーを返し、何度か評価するうちに正しい位置へ歩いていく」という形になる。
-読み込んだ直後だけカメラの向きが1フレーム古い、という不具合はこれだった。
-位置と回転は別のトラックなので、片方だけ崩れると同じ時刻でも違うフレームを指す。
-
-崩れるのは`interpolateRotations()`が180度を超える回転の区間へ中間キーを挿し込む経路で、挿し込んだ時刻が元のキーを追い越すことがある。
-時刻と値を組にしたまま並べ替えれば、キーそのものを捨てずに済む。
-時刻が重なったものだけは落とす。区間の長さが0になり、補間の割り算がNaNを生むため。
-@param clips <Array[<THREE.AnimationClip>]> 読み込んだクリップ。その場で直す。
-@returns <number> 直したトラックの数。
+キーを時刻の昇順に並べ直す。時刻と値は組にしたまま動かす。
+@param track <THREE.KeyframeTrack> 並べ直すトラック。その場で入れ替える。
 */
-function repairTrackTimes(clips) {
-  let fixed = 0;
+function sortTrackKeys(track) {
+  const times = track.times;
+  const values = track.values;
+  const n = times.length;
+  const stride = values.length / n;
+  const order = [];
+  for (let i = 0; i < n; i++) order.push(i);
+  order.sort((a, b) => times[a] - times[b]);
+
+  const newTimes = new times.constructor(n);
+  const newValues = new values.constructor(n * stride);
+  order.forEach((src, dst) => {
+    newTimes[dst] = times[src];
+    for (let c = 0; c < stride; c++) {
+      newValues[dst * stride + c] = values[src * stride + c];
+    }
+  });
+  track.times = newTimes;
+  track.values = newValues;
+}
+
+/*-
+バイナリFBXから読まれた負のキー時刻を、本来の値へ戻す。
+
+FBXは時刻を64ビット整数で持つが、FBXLoaderのバイナリリーダはこれを上位と下位の32ビットから組み直す。
+**負の値のとき、下位語の最上位ビットが0だと2^32だけ大きく読まれる。**
+時間の単位では4,294,967,296、60fpsなら5.5796フレーム分だけ後ろへずれる。
+アスキーは数値が文字列で書かれているので影響を受けない。
+
+ずれるのはキーの一部だけで、しかも時刻だけ。値は無傷。
+したがってトラックの中でキーの並びが入れ替わり、再生すると前後に飛ぶ。
+判定はファイルの中身に依存せず時刻の値だけで決まるので、**同じフレームが必ず同じように壊れる**。
+
+ずれ幅がフレームの整数倍ではないため、0とずれ幅の間（60fpsなら0f〜5.58f）には、
+ずれた負のキーと本物の正のキーが混ざる。
+ここだけはフレームの格子に乗っているかどうかで見分ける。ずれたものは必ず格子から外れる。
+
+同じ性質を症状の有無の判定にも使う。手前側に格子から外れたキーが1つも無いクリップには触らない。
+**これは0.160.0のFBXLoaderの読み方に較正した補正なので、three.jsを上げるときは必ず要否を確かめること。**
+上流が直った版に対してこの補正を当てると、今度はこちらが時刻を壊す。
+@param clips <Array[<THREE.AnimationClip>]> 読み込んだクリップ。その場で直す。
+@param fps <number> フレームレート。格子の判定に使う。
+@returns <Object> `{tracks: number, keys: number}`直したトラックの数と、時刻を戻したキーの数。
+*/
+function repairNegativeKeyTimes(clips, fps) {
+  if (!(fps > 0)) return { tracks: 0, keys: 0 };
+  const STEP = 4294967296;
+  const HALF = STEP / 2;
+  /*- そのキーがフレームの格子から外れているなら`true`。 */
+  const offGrid = (t) => {
+    const frame = t * fps;
+    return Math.abs(frame - Math.round(frame)) > 1e-3;
+  };
+
+  let tracks = 0;
+  let keys = 0;
   clips.forEach((clip) => {
+    /*
+    症状の無いクリップには触らない。
+    ずれ幅はフレームの整数倍ではないので、ずれたキーは必ず格子から外れる。
+    手前側に外れたキーが1つも無いなら、このクリップは正しく読めている。
+    */
+    let affected = false;
+    clip.tracks.forEach((track) => {
+      if (affected) return;
+      for (let i = 0; i < track.times.length; i++) {
+        const t = track.times[i];
+        if (t < FBX_INT32_SECONDS && offGrid(t)) { affected = true; return; }
+      }
+    });
+    if (!affected) return;
+
+    let changed = false;
     clip.tracks.forEach((track) => {
       const times = track.times;
-      const keys = times.length;
-      let ordered = true;
-      for (let i = 1; i < keys; i++) {
-        if (times[i] <= times[i - 1]) { ordered = false; break; }
+      let hits = 0;
+      for (let i = 0; i < times.length; i++) {
+        const t = times[i];
+        if (t >= FBX_INT32_SECONDS) continue; // ずれた値はここより手前にしか現れない。
+        let low = (t * FBX_KTIME) % STEP;
+        if (low < 0) low += STEP;
+        if (low >= HALF) continue; // 下位語の最上位が1なら正しく読めている。
+        // 0とずれ幅の間は本物の正のキーと混ざる。格子に乗っていれば本物。
+        if (t >= 0 && !offGrid(t)) continue;
+        times[i] = t - FBX_INT32_SECONDS;
+        hits++;
       }
-      if (ordered) return; // 正常なトラックは元のまま渡す。
-
-      const values = track.values;
-      const stride = values.length / keys;
-      const order = [];
-      for (let i = 0; i < keys; i++) order.push(i);
-      // 並べ替えは安定なので、同じ時刻のキーは元の順序を保ったまま並ぶ。
-      order.sort((a, b) => times[a] - times[b]);
-      const keep = order.filter((src, i) => i === 0 || times[src] > times[order[i - 1]]);
-
-      const newTimes = new times.constructor(keep.length);
-      const newValues = new values.constructor(keep.length * stride);
-      keep.forEach((src, dst) => {
-        newTimes[dst] = times[src];
-        for (let c = 0; c < stride; c++) {
-          newValues[dst * stride + c] = values[src * stride + c];
-        }
-      });
-      track.times = newTimes;
-      track.values = newValues;
-      fixed++;
+      if (!hits) return;
+      sortTrackKeys(track); // 戻した分だけ並びが崩れる。
+      keys += hits;
+      tracks++;
+      changed = true;
     });
-    // 末尾が最大とは限らなかったので、長さを取り直す。
-    if (fixed) clip.resetDuration();
+    if (changed) clip.resetDuration();
   });
-  return fixed;
+  return { tracks, keys };
+}
+
+/*-
+負のフレームから始まるクリップを、ミキサーが扱える0起点へ寄せる。
+
+three.jsのクリップは時刻0が始点である前提で、`duration`は最後のキーの時刻から決まり負の側を長さに数えない。
+加えて`LoopRepeat`のアクションは負の時刻をクリップの末尾へ巻き戻すので、そのまま渡すと終端のポーズが返る。
+したがってミキサーに見せる時刻だけは0起点でなければならない。
+
+ずらすのはトラックだけで、ビューアの側は最後までファイル上の時刻を扱う。
+再生位置も表示するフレーム番号も負のまま素直に流れ、自前で解析した焦点距離・ロール・可視性のカーブ（いずれもファイル上の時刻）にも手を触れずに済む。
+二つの時間軸を繋ぐのは`poseTime()`の1行だけ。
+@param clips <Array[<THREE.AnimationClip>]> 読み込んだクリップ。その場でずらす。
+@returns <Map<THREE.AnimationClip, number>> クリップ→ずらす前の先頭のキーの時刻（秒）。
+*/
+function alignClipsToStart(clips) {
+  const starts = new Map();
+  clips.forEach((clip) => {
+    let first = Infinity;
+    clip.tracks.forEach((track) => {
+      if (track.times.length) first = Math.min(first, track.times[0]);
+    });
+    if (!isFinite(first) || first >= 0) { starts.set(clip, 0); return; }
+    clip.tracks.forEach((track) => track.shift(-first));
+    clip.resetDuration(); // 長さが負の側の分だけ伸びる。
+    starts.set(clip, first);
+    console.info(
+      `[load] clip "${clip.name}" starts at ${first.toFixed(4)}s;`
+          + ` shifted to zero for playback`
+    );
+  });
+  return starts;
 }
 
 /*-
@@ -3654,7 +3754,16 @@ function fillFileInfo(name, vertexCount, boneCount) {
     ["Takes", String(animations.length)],
     ["fps", `${state.fps}${fbxSettings && fbxSettings.fpsSource ? ` (${fbxSettings.fpsSource})` : ""}`]
   ];
-  if (clip) rows.push(["Frames", String(totalFrames())]);
+  if (clip) {
+    /*
+    負のフレームから始まるファイルは、数だけでは何番から何番までなのか分からない。
+    */
+    rows.push([
+      "Frames", firstFrame()
+          ? `${totalFrames()}  (${firstFrame()} - ${lastFrame()})`
+          : String(totalFrames())
+    ]);
+  }
   if (fbxCameras.length) {
     rows.push(["Cameras", String(fbxCameras.length)]);
     /*
@@ -3700,6 +3809,8 @@ function disposeModel() {
   playDir = 1;
   state.inFrame = 0;
   state.outFrame = 0;
+  clipStarts = new Map();
+  clipStartTime = 0;
   clearWireOverlays(); // 先に複製を外す。ジオメトリとマテリアルを共有しているため。
   clearGhosts();
   clearCameraIcons(); // カメラゴーストも一緒に消える。
@@ -3737,6 +3848,7 @@ function setupTakes() {
     sel.disabled = true;
     setTransportEnabled(false);
     const scrub = document.getElementById("scrub");
+    scrub.min = "0";
     scrub.max = "0";
     scrub.value = "0";
     updatePlayButton();
@@ -3774,20 +3886,22 @@ function syncTakeTooltip() {
 function setTake(index) {
   if (mixer) mixer.stopAllAction();
   clip = animations[index];
+  clipStartTime = clipStarts.get(clip) || 0;
   mixer = new THREE.AnimationMixer(model);
   action = mixer.clipAction(clip);
   action.setLoop(THREE.LoopRepeat, Infinity);
   action.play();
 
-  const total = totalFrames();
-  state.inFrame = 0;
-  state.outFrame = total;
-  playhead = 0;
+  const first = firstFrame();
+  state.inFrame = first;
+  state.outFrame = lastFrame();
+  playhead = first / state.fps;
   playing = false;
 
   const scrub = document.getElementById("scrub");
-  scrub.max = String(total);
-  scrub.value = "0";
+  scrub.min = String(first);
+  scrub.max = String(lastFrame());
+  scrub.value = String(first);
 
   updatePlayButton();
   updateRangeBand();
@@ -3801,14 +3915,28 @@ function totalFrames() {
   return Math.max(1, Math.round(clip.duration * state.fps));
 }
 
-/*- 実効の開始フレーム。範囲の開始、または範囲が無効なら0。 */
+/*-
+クリップの最初のフレーム。
+`alignClipsToStart()`がトラックをずらした分だけ負になる。
+@returns <number> フレーム番号。
+*/
+function firstFrame() {
+  return clip ? Math.round(clipStartTime * state.fps) : 0;
+}
+
+/*- クリップの最後のフレーム。 */
+function lastFrame() {
+  return firstFrame() + totalFrames();
+}
+
+/*- 実効の開始フレーム。範囲の開始、または範囲が無効ならクリップの先頭。 */
 function effInFrame() {
-  return state.rangeEnabled ? state.inFrame : 0;
+  return state.rangeEnabled ? state.inFrame : firstFrame();
 }
 
 /*- 実効の終了フレーム。範囲の終了、または範囲が無効なら最終フレーム。 */
 function effOutFrame() {
-  return state.rangeEnabled ? state.outFrame : totalFrames();
+  return state.rangeEnabled ? state.outFrame : lastFrame();
 }
 
 /*-
@@ -3827,7 +3955,11 @@ function poseTime(t) {
   let v = t;
   if (frameSnap && state.fps > 0) v = Math.round(v * state.fps) / state.fps;
   const end = Math.max(clip.duration - 1e-4, 0);
-  return THREE.MathUtils.clamp(v, 0, end);
+  /*
+  ここがファイル上の時刻とクリップ内の時刻の唯一の境目。
+  負のフレームから始まるファイルは`alignClipsToStart()`でトラックを0起点へ寄せてあるので、同じ分だけ引いて渡す。
+  */
+  return THREE.MathUtils.clamp(v - clipStartTime, 0, end);
 }
 
 /*- ミキサーを進めずに、現在の再生位置でスケルトンをポーズさせる。 */
@@ -6185,7 +6317,7 @@ function gatherCameraInfo(cam) {
     ["model center", p3(modelCenter)],
     ["model radius", modelRadius.toFixed(2)],
     ["dist to center", pos.distanceTo(modelCenter).toFixed(2)],
-    ["frame", clip ? `${Math.round(playhead * state.fps)} / ${totalFrames()}` : "-"]
+    ["frame", clip ? `${Math.round(playhead * state.fps)} / ${lastFrame()}` : "-"]
   );
   if (aim) {
     const aimPos = new THREE.Vector3().setFromMatrixPosition(aim.matrixWorld);
@@ -6281,6 +6413,7 @@ function gatherSceneInfo() {
     [
       "clip length", clip
           ? `${clip.duration.toFixed(4)} s  /  ${totalFrames()} frames`
+              + `  (${firstFrame()} - ${lastFrame()})`
           : "-"
     ],
     ["pivots fixed", n(pivotsFixed)],
@@ -6389,10 +6522,11 @@ function goToRangeEdge(edge) {
 
 /*- Range Start/Endの帯をタイムラインのトラック上に置き直す。 */
 function updateRangeBand() {
-  const total = totalFrames() || 1;
+  const span = totalFrames() || 1;
+  const first = firstFrame();
   const band = document.getElementById("rangeBand");
-  band.style.left = (state.inFrame / total * 100) + "%";
-  band.style.width = ((state.outFrame - state.inFrame) / total * 100) + "%";
+  band.style.left = ((state.inFrame - first) / span * 100) + "%";
+  band.style.width = ((state.outFrame - state.inFrame) / span * 100) + "%";
   /*
   帯全体を薄くすると両端も道連れになる。
   そして範囲が無効なときは両端を完全に消す必要がある。
@@ -6406,10 +6540,12 @@ function updateRangeBand() {
 @param frame <number> 要求する開始フレーム。
 */
 function setRangeStart(frame) {
-  const total = totalFrames();
-  const f = THREE.MathUtils.clamp(isNaN(frame) ? state.inFrame : frame, 0, Math.max(total - 1, 0));
+  const first = firstFrame();
+  const last = lastFrame();
+  const f = THREE.MathUtils.clamp(
+    isNaN(frame) ? state.inFrame : frame, first, Math.max(last - 1, first));
   state.inFrame = f;
-  if (state.outFrame <= f) state.outFrame = Math.min(f + 1, total);
+  if (state.outFrame <= f) state.outFrame = Math.min(f + 1, last);
   updateRangeBand();
 }
 
@@ -6418,19 +6554,20 @@ function setRangeStart(frame) {
 @param frame <number> 要求する終了フレーム。
 */
 function setRangeEnd(frame) {
-  const total = totalFrames();
-  const f = THREE.MathUtils.clamp(isNaN(frame) ? state.outFrame : frame, 1, total);
+  const first = firstFrame();
+  const last = lastFrame();
+  const f = THREE.MathUtils.clamp(
+    isNaN(frame) ? state.outFrame : frame, Math.min(first + 1, last), last);
   state.outFrame = f;
-  if (state.inFrame >= f) state.inFrame = Math.max(f - 1, 0);
+  if (state.inFrame >= f) state.inFrame = Math.max(f - 1, first);
   updateRangeBand();
 }
 
-/*- 再生範囲をクリップ全体（開始0、終了は総フレーム数）へ戻す。 */
+/*- 再生範囲をクリップ全体（先頭のフレームから最終フレームまで）へ戻す。 */
 function resetRange() {
   if (!clip) return;
-  const total = totalFrames();
-  state.inFrame = 0;
-  state.outFrame = total;
+  state.inFrame = firstFrame();
+  state.outFrame = lastFrame();
   updateRangeBand();
 }
 
@@ -6462,7 +6599,7 @@ function updateReadout() {
   }
   else {
     const frame = Math.round(playhead * state.fps);
-    out.innerHTML = `${frame} / ${totalFrames()} <span class='dim'>frame</span>  `
+    out.innerHTML = `${frame} / ${lastFrame()} <span class='dim'>frame</span>  `
         + `<span class='dim'>${playhead.toFixed(2)}s</span>`;
   }
   document.getElementById("vpFrame").textContent = clip
@@ -6473,12 +6610,12 @@ function updateReadout() {
 /*- 現在のフレームのラベルを、タイムラインの再生ヘッドの上に置く。 */
 function updatePlayheadLabel() {
   const label = document.getElementById("playheadLabel");
-  const total = totalFrames();
-  if (!clip || total <= 0) { label.style.display = "none"; return; }
+  const span = totalFrames();
+  if (!clip || span <= 0) { label.style.display = "none"; return; }
   const frame = Math.round(playhead * state.fps);
   label.style.display = "block";
   label.textContent = String(frame);
-  label.style.left = (frame / total * 100) + "%";
+  label.style.left = ((frame - firstFrame()) / span * 100) + "%";
 }
 
 /*-
@@ -7164,9 +7301,13 @@ document.getElementById("speedSelect").addEventListener("change", (e) =>
 
 document.getElementById("fpsInput").addEventListener("change", (e) => {
   state.fps = Math.max(1, parseFloat(e.target.value) || 60);
-  const total = totalFrames();
-  state.outFrame = Math.min(state.outFrame, total);
-  document.getElementById("scrub").max = String(total);
+  const first = firstFrame();
+  const last = lastFrame();
+  state.inFrame = THREE.MathUtils.clamp(state.inFrame, first, last);
+  state.outFrame = THREE.MathUtils.clamp(state.outFrame, first, last);
+  const scrub = document.getElementById("scrub");
+  scrub.min = String(first);
+  scrub.max = String(last);
   updateRangeBand();
   syncScrub();
   updateReadout();
