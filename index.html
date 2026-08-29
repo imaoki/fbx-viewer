@@ -86,6 +86,7 @@ Googleのmotion_modeを黒地に載せたもの。線画のままだと明るい
     --panel: #444444;
     --panel-2: #5d5d5d; /* ボタン、ドロップダウン、スクロールバーのつまみ。 */
     --panel-2-hover: #707070;
+    --panel-sub: #494949; /* 枠の中に入れ子にした小枠。地の色を少しだけ持ち上げて区切りを示す。 */
     --field: #2b2b2b; /* 数値入力欄とタイムラインの地。Mayaはデータ欄だけ深いまま残す。 */
     --line: #383838;
     --text: #bbbbbb;
@@ -577,15 +578,36 @@ Googleのmotion_modeを黒地に載せたもの。線画のままだと明るい
   #debugOverlay .k { color: var(--text-dim); }
   #debugOverlay .t { color: var(--text); font-weight: 600; }
 
-  #meshList {
+  #meshList,
+  #ghostJointList {
     margin-top: 6px;
     max-height: 220px;
     overflow-y: auto;
   }
   /* 枠の中に入れ子になった一覧なので、帯はページ全体のものより細い。 */
-  #meshList::-webkit-scrollbar { width: 8px; }
-  #meshList::-webkit-scrollbar-thumb { border-width: 2px; border-radius: 4px; }
+  #meshList::-webkit-scrollbar,
+  #ghostJointList::-webkit-scrollbar { width: 8px; }
+  #meshList::-webkit-scrollbar-thumb,
+  #ghostJointList::-webkit-scrollbar-thumb { border-width: 2px; border-radius: 4px; }
   #meshList .mesh-row { gap: 8px; }
+  /*
+  木の行。
+  インデントは`padding-left`で入れる。深いリグでも名前の幅を食い潰さないよう、描画側で頭打ちにしている。
+  */
+  #ghostJointList .joint-row {
+    gap: 4px;
+    padding-right: 0;
+  }
+  /* 展開の三角。子を持たない行でも同じ幅を占めて、名前の開始位置を揃える。 */
+  .joint-chev {
+    flex: 0 0 auto;
+    width: 16px;
+    font-size: 14px;
+    color: var(--text-dim);
+    text-align: center;
+  }
+  .joint-chev.leaf { visibility: hidden; }
+  #ghostJointList:empty::before { content: "No joints loaded"; color: var(--text-dim); }
   /* Show/Hide/Animを巡回するので、グリフはラベルではなく状態そのもの。 */
   .vis-btn {
     flex: 0 0 auto;
@@ -600,7 +622,8 @@ Googleのmotion_modeを黒地に載せたもの。線画のままだと明るい
     border-color: var(--accent);
   }
   /* 名前の側だけ。この規則は.msを上回るので、グリフのspanに等幅を強制するとアイコンの合字が成立しなくなる。 */
-  #meshList .mesh-row span:not(.ms) {
+  #meshList .mesh-row span:not(.ms),
+  #ghostJointList .joint-row span:not(.ms) {
     font-family: var(--mono);
     font-size: 11px;
     overflow: hidden;
@@ -725,6 +748,19 @@ Googleのmotion_modeを黒地に載せたもの。線画のままだと明るい
     transform: rotate(-90deg);
   }
   .group[open] > summary .chev { transform: rotate(0deg); }
+
+  /*
+  枠の中に入れ子にした小枠。
+  左右のマージンで親の内側余白を打ち消し、自分で同じだけ入れ直す。
+  帯として枠いっぱいに広がりつつ、**内容に使える幅は親と同じ**なので、一覧のインデント幅の勘定が変わらない。
+  */
+  .group .group {
+    background: var(--panel-sub);
+    margin: 8px -14px -10px;
+    padding: 8px 14px 10px;
+    border-top: 1px solid var(--line);
+    border-bottom: 0;
+  }
 
   .row { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
   .row:last-child { margin-bottom: 0; }
@@ -1530,6 +1566,16 @@ Googleのmotion_modeを黒地に載せたもの。線画のままだと明るい
       </div>
       <label class="toggle" title="Draw the ghosts through whatever is in front of them"><span>Ghost On Top</span>
         <input type="checkbox" id="ghostOnTopToggle" checked></label>
+      <details class="group" data-key="ghostJoints">
+        <summary><span class="ms chev">expand_more</span>Joints</summary>
+        <label class="toggle" title="Toggling a joint also toggles everything under it"><span>Apply to Children</span>
+          <input type="checkbox" id="ghostCascadeToggle" checked></label>
+        <div class="row">
+          <button id="ghostJointAllBtn">Show All</button>
+          <button id="ghostJointNoneBtn">Hide All</button>
+        </div>
+        <div id="ghostJointList"></div>
+      </details>
     </details>
 
     <details class="group" data-key="color">
@@ -1880,7 +1926,7 @@ watchIconFont();
 // -----------------------------------------------------------------------------
 
 /*- @var <string> アプリのバージョン（semver）。ここが唯一の出所。 */
-const APP_VERSION = "1.71.0";
+const APP_VERSION = "1.72.0";
 const APP_NAME = "FBX Viewer";
 document.getElementById("appVersion").textContent = APP_VERSION;
 document.getElementById("helpVersion").textContent = APP_VERSION;
@@ -2268,6 +2314,9 @@ const GHOST_OPACITY_FAR = 0.15; // 最も遠いゴーストの濃さ。
 let ghosts = [];
 let cameraGhosts = [];
 let lastGhostKey = "";
+// ゴーストから外したジョイントの名前。名前で持つので、重複したBoneオブジェクトはまとめて効く。
+let ghostJointsOff = new Set();
+let ghostTreeOpen = new Set(); // 一覧で展開しているジョイントの名前。
 
 // -----------------------------------------------------------------------------
 // モデル/アニメーションの状態
@@ -3575,6 +3624,12 @@ function onModelLoaded(obj, name) {
   buildVisibilityRecords();
   applyMeshVisibility();
   renderMeshList();
+  /*
+  ジョイントの名前はファイルごとに違うので、絞り込みも展開状態も持ち越さない。
+  */
+  ghostJointsOff = new Set();
+  ghostTreeOpen = new Set();
+  renderGhostJointList();
   currentView = "persp";
   rebuildViewOptions();
   recomputeBounds();
@@ -3837,6 +3892,13 @@ function disposeModel() {
   texturedMaterials.forEach((mat) => mat.dispose());
   texturedMaterials.clear();
   if (skeletonHelper) { scene.remove(skeletonHelper); skeletonHelper = null; }
+  /*
+  絞り込みは今消えたスケルトンのものなので一緒に捨てる。
+  一覧は`renderGhostJointList()`が空表示に落ちる。
+  */
+  ghostJointsOff = new Set();
+  ghostTreeOpen = new Set();
+  renderGhostJointList();
   if (model) {
     scene.remove(model);
     model.traverse((child) => {
@@ -5038,7 +5100,7 @@ function applySkeletonColors() {
 }
 
 /*-
-SkeletonHelperが描くであろうボーンの対（子,親）。
+スケルトンの親子リンク。ゴーストの絞り込みを適用する前の、そのままの一覧。
 
 **同じジョイントを二度描かない。**
 FBXLoaderはスキンクラスタごとにBoneを作るので、同じジョイントが別のオブジェクトとして複数現れる
@@ -5047,12 +5109,18 @@ FBXLoaderはスキンクラスタごとにBoneを作るので、同じジョイ�
 そのままでは重複のある部位だけが飽和し、褪せ方が部位ごとに違って見える。
 @returns <Array[<Array>]> 子と親の対。名前の組で重複を除いたもの。
 */
-function ghostBonePairs() {
+function skeletonLinks() {
   if (!skeletonHelper) return [];
   const seen = new Set();
   const out = [];
   skeletonHelper.bones.forEach((bone) => {
     if (!bone.parent || !bone.parent.isBone) return;
+    /*
+    **複製は元のジョイントの子として置かれる。**
+    そのため親子が同じ名前になる組が現れるが、これは繋がりではなく同じ位置にある同じジョイント。
+    線として引いても長さが0で見えないうえ、名前で親子を持つ一覧では自分が自分の親になり、その鎖が永久に根を持たなくなる。
+    */
+    if (boneKey(bone) === boneKey(bone.parent)) return;
     const key = `${boneKey(bone)}\u0000${boneKey(bone.parent)}`;
     if (seen.has(key)) return;
     seen.add(key);
@@ -5071,17 +5139,16 @@ function boneKey(bone) {
 }
 
 /*-
-点で描くときに拾うボーン。
-線は親子を結ぶので根元のボーンも対の一方として現れるが、点では自分自身しか描かないため、
-対の集合から親子の両方を集めないと根元が抜け落ちる。
-対の側で既に重複を除いてあるが、親子をほどくと同じジョイントが再び現れるのでここでも除く。
-@returns <Array[<Object>]> 重複を除いたボーン。
+スケルトンに現れるジョイント。リンクの両端から集めたもので、絞り込みは適用しない。
+一覧の組み立てと、絞り込みの対象を数えるのに使う。
+@returns <Array[<Object>]> 重複を除いたボーン。親から子への順。
 */
-function ghostBoneNodes() {
+function ghostJoints() {
   const seen = new Set();
   const out = [];
-  ghostBonePairs().forEach((pair) => {
-    pair.forEach((bone) => {
+  skeletonLinks().forEach((pair) => {
+    // 親を先に入れる。根が一覧の先頭に来るようにするため。
+    [pair[1], pair[0]].forEach((bone) => {
       const key = boneKey(bone);
       if (seen.has(key)) return;
       seen.add(key);
@@ -5091,9 +5158,222 @@ function ghostBoneNodes() {
   return out;
 }
 
+/*-
+そのジョイントをゴーストに描くなら`true`。
+@param bone <Object> 対象のボーン。
+@returns <boolean> 描くなら`true`。
+*/
+function ghostJointOn(bone) {
+  return !ghostJointsOff.has(boneKey(bone));
+}
+
+/*-
+ゴーストとして線で描く親子リンク。
+
+**リンクは子の持ち物として扱う。**線はジョイントそのものではなく親子の繋がりを表しており、
+根を除く全てのジョイントがちょうど1本のリンクを持つので、子で判定すると過不足が無い。
+親で判定すると、指先やつま先のような葉のジョイントを消しても何も起きない。
+@returns <Array[<Array>]> 子が表示対象であるリンクだけ。
+*/
+function ghostBonePairs() {
+  return skeletonLinks().filter((pair) => ghostJointOn(pair[0]));
+}
+
+/*-
+ゴーストとして点で描くジョイント。
+
+点は自分自身を描くので、リンクではなくジョイントを直接絞り込む。
+リンク側の絞り込みを流用すると、消したジョイントが他のリンクの親として残り、点だけが描かれてしまう。
+@returns <Array[<Object>]> 表示対象のボーン。
+*/
+function ghostBoneNodes() {
+  return ghostJoints().filter(ghostJointOn);
+}
+
 /*- ゴーストを点で描くなら`true`。 */
 function ghostAsPoints() {
   return document.getElementById("ghostStyleSelect").value === "points";
+}
+
+/*-
+@var <number> 一覧のインデント幅（px）。
+設定ペインは264pxしかなく、枠の余白と展開の三角と目のアイコンを引くと名前に使えるのは178px。
+キャラクタリグは指先まで12階層ほど潜るので、1段あたりを詰めないと名前が省略される。
+*/
+const JOINT_INDENT = 4;
+
+/*-
+ジョイントの木を組む。
+リンクの子から親を引けるので、親を持たないものが根になる。
+@returns <Object> `{roots: Array, children: Map, byKey: Map}`名前を鍵にした木。
+*/
+function ghostJointTree() {
+  const joints = ghostJoints();
+  const byKey = new Map();
+  joints.forEach((b) => byKey.set(boneKey(b), b));
+  const parentOf = new Map();
+  skeletonLinks().forEach((pair) => {
+    const childKey = boneKey(pair[0]);
+    const parentKey = boneKey(pair[1]);
+    if (parentOf.has(childKey)) return;
+    /*
+    親を辿って自分へ戻る繋がりは採らない。
+    名前で親子を持つ以上、離れた場所にある同名のジョイント同士が輪を作り得る。
+    輪ができるとその鎖は根を持たず、一覧から丸ごと消える。
+    */
+    let at = parentKey;
+    while (at !== undefined) {
+      if (at === childKey) return;
+      at = parentOf.get(at);
+    }
+    parentOf.set(childKey, parentKey);
+  });
+  const children = new Map();
+  const roots = [];
+  joints.forEach((bone) => {
+    const key = boneKey(bone);
+    const pk = parentOf.get(key);
+    if (pk === undefined || !byKey.has(pk)) { roots.push(bone); return; }
+    if (!children.has(pk)) children.set(pk, []);
+    children.get(pk).push(bone);
+  });
+  return { roots, children, byKey };
+}
+
+/*-
+あるジョイントとその配下を全て集める。
+親を切り替えたら配下も追随させるために要る。深い階層を開かなくても一括で扱えるようにする狙い。
+@param bone <Object> 起点のボーン。
+@param tree <Object> `ghostJointTree()`の戻り値。
+@returns <Array[<Object>]> 起点を含む配下のボーン。
+*/
+function ghostJointBranch(bone, tree) {
+  const out = [];
+  const seen = new Set();
+  const walk = (b) => {
+    const key = boneKey(b);
+    // 名前で親子を持つので、名前が衝突すると自分が自分の先祖になり得る。辿り直さない。
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(b);
+    (tree.children.get(key) || []).forEach(walk);
+  };
+  walk(bone);
+  return out;
+}
+
+/*- ジョイントの切り替えを配下へ伝えるなら`true`。 */
+function ghostCascadeEnabled() {
+  return document.getElementById("ghostCascadeToggle").checked;
+}
+
+/*- ゴーストのジョイント一覧を描き直す。 */
+function renderGhostJointList() {
+  const list = document.getElementById("ghostJointList");
+  list.innerHTML = "";
+  const tree = ghostJointTree();
+  if (!tree.roots.length) {
+    list.textContent = "No joints loaded";
+    return;
+  }
+
+  const addRow = (bone, depth, seen) => {
+    const key = boneKey(bone);
+    if (seen.has(key)) return; // 名前の衝突で先祖に戻る可能性があるため。
+    seen.add(key);
+    const kids = tree.children.get(key) || [];
+    const row = document.createElement("div");
+    row.className = "toggle joint-row";
+    row.style.paddingLeft = `${depth * JOINT_INDENT}px`;
+
+    const chev = document.createElement("span");
+    chev.className = kids.length ? "ms joint-chev" : "ms joint-chev leaf";
+    chev.textContent = ghostTreeOpen.has(key) ? "expand_more" : "chevron_right";
+    if (kids.length) chev.title = "Shift+click to expand everything below";
+
+    const name = document.createElement("span");
+    name.textContent = bone.name || "(unnamed)";
+
+    const btn = document.createElement("button");
+    btn.className = "icon-btn vis-btn";
+    const glyph = document.createElement("span");
+    glyph.className = "ms";
+    btn.appendChild(glyph);
+
+    const paint = () => {
+      const on = ghostJointOn(bone);
+      glyph.textContent = on ? "visibility" : "visibility_off";
+      btn.dataset.mode = on ? "show" : "hide";
+      btn.title = `${bone.name || "(unnamed)"}`
+          + (kids.length ? ` — ${kids.length} child joint(s)` : "")
+          + (on ? "" : " — hidden from ghosts");
+      name.title = btn.title;
+    };
+
+    /*
+    三角は展開だけを担う。行全体は表示の切り替えなので、ここで伝播を止めないと両方が起きる。
+    Shiftを添えると配下も一緒に開閉する。指先まで一気に見たいときに、階層のぶんだけ押さずに済む。
+    */
+    chev.addEventListener("click", (e) => {
+      if (!kids.length) return;
+      e.stopPropagation();
+      const open = !ghostTreeOpen.has(key);
+      if (e.shiftKey) {
+        ghostJointBranch(bone, tree).forEach((b) => {
+          const k = boneKey(b);
+          // 子を持たないジョイントは開く先が無いので覚えない。
+          if (!(tree.children.get(k) || []).length) return;
+          if (open) ghostTreeOpen.add(k);
+          else ghostTreeOpen.delete(k);
+        });
+      }
+      else if (open) ghostTreeOpen.add(key);
+      else ghostTreeOpen.delete(key);
+      renderGhostJointList();
+    });
+
+    row.addEventListener("click", () => {
+      const on = ghostJointOn(bone);
+      /*
+      継承を切ると、押したジョイント1つだけが変わる。
+      「手首だけ残す」のように、ある高さの一段だけを見たい場合に、配下を個別に消す手間が省ける。
+      */
+      const targets = ghostCascadeEnabled() ? ghostJointBranch(bone, tree) : [bone];
+      targets.forEach((b) => {
+        if (on) ghostJointsOff.add(boneKey(b));
+        else ghostJointsOff.delete(boneKey(b));
+      });
+      renderGhostJointList();
+      refreshGhosts();
+    });
+
+    paint();
+    row.append(chev, name, btn);
+    list.appendChild(row);
+    if (ghostTreeOpen.has(key)) kids.forEach((k) => addRow(k, depth + 1, seen));
+  };
+
+  const seen = new Set();
+  tree.roots.forEach((r) => addRow(r, 0, seen));
+}
+
+/*-
+ゴーストの絞り込みを一括で切り替える。
+@param visible <boolean> 全て表示するなら`true`。
+*/
+function setAllGhostJoints(visible) {
+  ghostJointsOff = new Set();
+  if (!visible) ghostJoints().forEach((b) => ghostJointsOff.add(boneKey(b)));
+  renderGhostJointList();
+  refreshGhosts();
+}
+
+/*-
+ゴーストを次の描画で組み直させる。
+`updateGhosts()`は前回と同じ条件なら何もしないので、絞り込みのように鍵に含まれない変更はここで無効化する。
+*/
+function refreshGhosts() {
+  lastGhostKey = "";
 }
 
 /*- ゴーストのラインオブジェクトを全て取り除く。 */
@@ -5195,10 +5475,13 @@ function updateGhosts() {
   const perItem = points ? 1 : 2;
   const offsets = ghostOffsets();
   /*
-  頂点数と描画の種類が変わるとジオメトリを作り直すしかないので、本数だけでなく形式も見る。
+  頂点数と描画の種類が変わるとジオメトリを作り直すしかないので、本数だけでなく形式と点数も見る。
+  ジョイントの絞り込みは本数を変えないまま頂点数だけを変えるため、ここを見ないと古い大きさのまま描き続ける。
   */
   const stale = offsets.length !== ghosts.length
-      || (ghosts.length && ghosts[0].isPoints !== points);
+      || (ghosts.length && ghosts[0].isPoints !== points)
+      || (ghosts.length
+        && ghosts[0].geometry.getAttribute("position").count !== nodes.length * perItem);
   if (stale) {
     clearGhosts();
     offsets.forEach(() => {
@@ -7250,6 +7533,8 @@ document.getElementById("shadedPresetSelect").addEventListener("change", (e) => 
 
 document.getElementById("meshAllBtn").addEventListener("click", () => setAllMeshesVisible(true));
 document.getElementById("meshNoneBtn").addEventListener("click", () => setAllMeshesVisible(false));
+document.getElementById("ghostJointAllBtn").addEventListener("click", () => setAllGhostJoints(true));
+document.getElementById("ghostJointNoneBtn").addEventListener("click", () => setAllGhostJoints(false));
 document.getElementById("skelToggle").addEventListener("change", (e) => {
   if (skeletonHelper) skeletonHelper.visible = e.target.checked;
   lastGhostKey = "";
@@ -7797,6 +8082,7 @@ function registerSettings() {
   persistControl("ghost.dir", "ghostDirSelect");
   persistControl("ghost.style", "ghostStyleSelect");
   persistControl("ghost.pointSize", "ghostPointSizeInput", "ghostPointSizeResetBtn");
+  persistControl("ghost.cascade", "ghostCascadeToggle");
   persistControl("ghost.onTop", "ghostOnTopToggle");
 
   persistControl("color.background", "bgColor", "bgResetBtn");
