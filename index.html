@@ -1514,6 +1514,20 @@ Googleのmotion_modeを黒地に載せたもの。線画のままだと明るい
           <option value="both">Both</option>
         </select>
       </div>
+      <div class="row" style="align-items:center;flex-wrap:nowrap;">
+        <span class="label" style="flex:1 1 auto;" title="How the ghosted skeleton is drawn">Ghost Style</span>
+        <select id="ghostStyleSelect">
+          <option value="lines" selected>Lines</option>
+          <option value="points">Points</option>
+        </select>
+      </div>
+      <div class="row" style="align-items:center;flex-wrap:nowrap;">
+        <span class="label" style="flex:1 1 auto;" title="Size of each point, in pixels">Ghost Point Size</span>
+        <div class="pair value-pair">
+          <input type="number" id="ghostPointSizeInput" value="4" min="1" max="16" step="1">
+          <button id="ghostPointSizeResetBtn" title="Reset to default" aria-label="Reset Ghost Point Size"><span class="ms">reset_settings</span></button>
+        </div>
+      </div>
       <label class="toggle" title="Draw the ghosts through whatever is in front of them"><span>Ghost On Top</span>
         <input type="checkbox" id="ghostOnTopToggle" checked></label>
     </details>
@@ -1732,7 +1746,7 @@ Googleのmotion_modeを黒地に載せたもの。線画のままだと明るい
           <dt>fps</dt><dd>The conversion between seconds and frames, detected from the file. It sets frame numbering, stepping, Snap and the Range boundaries — not the playback rate.</dd>
           <dt>Range</dt><dd>Plays a sub-section. Start and End are kept when Range is switched off.</dd>
           <dt>Snap</dt><dd>Samples whole frames instead of real time, the way a DCC timeline steps.</dd>
-          <dt>Skeleton Ghost</dt><dd>Draws the skeleton at surrounding frames. Span, Step and direction are in the Ghost group.</dd>
+          <dt>Skeleton Ghost</dt><dd>Draws the skeleton at surrounding frames. Span, Step, direction and style are in the Ghost group. Points draw a marker at each joint instead of the bones between them.</dd>
           <dt>Gate Mask</dt><dd>Resolution gate for FBX cameras. Gate Fit follows the file, so the framing matches the DCC it came from.</dd>
           <dt>Units</dt><dd>One grid cell is a metre, converted through the unit scale the file records — a scene authored in centimetres still gets metre cells. Grid Size adds ten cells to each side per level, so level 1 is a ten metre square.</dd>
           <dt>Grid Fill</dt><dd>A solid plane over the grid. It is one-sided, so it hides what is below the ground when seen from above but not from underneath.</dd>
@@ -1773,7 +1787,7 @@ Googleのmotion_modeを黒地に載せたもの。線画のままだと明るい
           <dt>fps</dt><dd>秒とフレームの換算値で、ファイルから自動検出されます。フレーム番号、コマ送りの幅、Snapの丸め先、Rangeの境界を決めます。再生速度は変わりません。</dd>
           <dt>Range</dt><dd>区間を指定して再生します。オフにしてもStart/Endの値は保持されます。</dd>
           <dt>Snap</dt><dd>実時間ではなく整数フレームでポーズを拾います。DCCのタイムラインと同じ送り方になります。</dd>
-          <dt>Skeleton Ghost</dt><dd>前後のフレームのスケルトンを重ねて描画します。範囲・間隔・方向はGHOST枠で調整します。</dd>
+          <dt>Skeleton Ghost</dt><dd>前後のフレームのスケルトンを重ねて描画します。範囲・間隔・方向・描画形式はGHOST枠で調整します。Pointsはボーンの代わりにジョイントの位置へ点を描きます。</dd>
           <dt>Gate Mask</dt><dd>FBXカメラのレゾリューションゲートです。Gate Fitをファイルから読むので、元のDCCと同じ構図になります。</dd>
           <dt>Units</dt><dd>グリッドは1セルが1メートルです。ファイルが記録している単位スケールから換算するので、センチメートルで作られたシーンでも1セルは1メートルになります。Grid Sizeを1つ上げるごとに一辺が10セル増えるので、レベル1は10メートル四方です。</dd>
           <dt>Grid Fill</dt><dd>グリッドを塗りつぶす面です。片面なので、上から見れば地面下が隠れ、下に回り込めばそのまま見えます。</dd>
@@ -1866,7 +1880,7 @@ watchIconFont();
 // -----------------------------------------------------------------------------
 
 /*- @var <string> アプリのバージョン（semver）。ここが唯一の出所。 */
-const APP_VERSION = "1.70.0";
+const APP_VERSION = "1.71.0";
 const APP_NAME = "FBX Viewer";
 document.getElementById("appVersion").textContent = APP_VERSION;
 document.getElementById("helpVersion").textContent = APP_VERSION;
@@ -2248,6 +2262,9 @@ function ghostOrder() {
   return ghostOnTop() ? ORDER_GHOST_ON_TOP : ORDER_GHOST_NORMAL;
 }
 const GHOST_MAX = 40; // 採取するポーズ数の上限。
+const GHOST_POINT_SIZE = 4; // 点で描くときの一辺のピクセル数。
+const GHOST_OPACITY_NEAR = 0.7; // 再生位置に最も近いゴーストの濃さ。
+const GHOST_OPACITY_FAR = 0.15; // 最も遠いゴーストの濃さ。
 let ghosts = [];
 let cameraGhosts = [];
 let lastGhostKey = "";
@@ -5020,12 +5037,63 @@ function applySkeletonColors() {
   colors.needsUpdate = true;
 }
 
-/*- SkeletonHelperが描くであろうボーンの対（子,親）。 */
+/*-
+SkeletonHelperが描くであろうボーンの対（子,親）。
+
+**同じジョイントを二度描かない。**
+FBXLoaderはスキンクラスタごとにBoneを作るので、同じジョイントが別のオブジェクトとして複数現れる
+（Scene Infoの`Bone objs`と`distinct bones`の差がその数）。
+生きているスケルトンは不透明なので重なっても分からないが、半透明なゴーストは重なった分だけ濃くなる。
+そのままでは重複のある部位だけが飽和し、褪せ方が部位ごとに違って見える。
+@returns <Array[<Array>]> 子と親の対。名前の組で重複を除いたもの。
+*/
 function ghostBonePairs() {
   if (!skeletonHelper) return [];
-  return skeletonHelper.bones
-    .filter((b) => b.parent && b.parent.isBone)
-    .map((b) => [b, b.parent]);
+  const seen = new Set();
+  const out = [];
+  skeletonHelper.bones.forEach((bone) => {
+    if (!bone.parent || !bone.parent.isBone) return;
+    const key = `${boneKey(bone)}\u0000${boneKey(bone.parent)}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push([bone, bone.parent]);
+  });
+  return out;
+}
+
+/*-
+ジョイントを見分ける鍵。名前が無いものだけuuidに落とす。
+@param bone <Object> 対象のボーン。
+@returns <string> 同じジョイントなら一致する文字列。
+*/
+function boneKey(bone) {
+  return bone.name || bone.uuid;
+}
+
+/*-
+点で描くときに拾うボーン。
+線は親子を結ぶので根元のボーンも対の一方として現れるが、点では自分自身しか描かないため、
+対の集合から親子の両方を集めないと根元が抜け落ちる。
+対の側で既に重複を除いてあるが、親子をほどくと同じジョイントが再び現れるのでここでも除く。
+@returns <Array[<Object>]> 重複を除いたボーン。
+*/
+function ghostBoneNodes() {
+  const seen = new Set();
+  const out = [];
+  ghostBonePairs().forEach((pair) => {
+    pair.forEach((bone) => {
+      const key = boneKey(bone);
+      if (seen.has(key)) return;
+      seen.add(key);
+      out.push(bone);
+    });
+  });
+  return out;
+}
+
+/*- ゴーストを点で描くなら`true`。 */
+function ghostAsPoints() {
+  return document.getElementById("ghostStyleSelect").value === "points";
 }
 
 /*- ゴーストのラインオブジェクトを全て取り除く。 */
@@ -5045,8 +5113,13 @@ function ghostsEnabled() {
 }
 
 /*-
-採取する符号付きのフレームオフセット。再生位置に近いものから並ぶ。
-二種類のゴーストで共有し、常に同じフレームに着くようにする。
+採取する符号付きのフレームオフセット。再生位置から遠いものが先に並ぶ。
+
+**この順序がそのまま描画順になる。**
+ゴーストはどれもワールド座標をジオメトリへ書き込んで原点に置くので、全てが同じ深度を持つ。
+レンダラは深度で並べ替えられず生成順に落ちるため、後に作ったものが上に重なる。
+遠く薄いものから先に描かないと、近く濃いものがその上から塗り潰されて褪せ方が逆に見える。
+線では重なりが稀なので目立たないが、点は常に重なるのではっきり出る。
 @returns <number[]> フレーム単位のオフセット。描くものが無ければ空。
 */
 function ghostOffsets() {
@@ -5055,11 +5128,17 @@ function ghostOffsets() {
   const dir = document.getElementById("ghostDirSelect").value;
   const count = Math.min(Math.floor(span / step), GHOST_MAX);
   const offsets = [];
-  for (let i = 1; i <= count; i++) {
+  for (let i = count; i >= 1; i--) {
     if (dir === "past" || dir === "both") offsets.push(-i * step);
     if (dir === "future" || dir === "both") offsets.push(i * step);
   }
   return offsets;
+}
+
+/*- 点で描くときの一辺のピクセル数。 */
+function ghostPointSize() {
+  const v = parseInt(document.getElementById("ghostPointSizeInput").value, 10);
+  return Math.min(Math.max(v || GHOST_POINT_SIZE, 1), 16);
 }
 
 /*- ゴーストを手前にあるものより前に描くべきなら`true`。 */
@@ -5068,16 +5147,33 @@ function ghostOnTop() {
 }
 
 /*-
+オフセットの組が取る、最も近い距離と最も遠い距離。
+濃さをこの二つの間へ割り付けるために要る。
+@param offsets <number[]> フレーム単位のオフセット。
+@returns <Object> `{min: number, max: number}`絶対値での両端。
+*/
+function ghostSpread(offsets) {
+  const abs = offsets.map((o) => Math.abs(o));
+  return { min: Math.min.apply(null, abs), max: Math.max.apply(null, abs) };
+}
+
+/*-
 ゴーストがどれだけ褪せているか、そしてパレットのどちら側を採るか。
+
+濃さは組の中の両端へ線形に割り付ける。
+**最も近いものが必ず`GHOST_OPACITY_NEAR`、最も遠いものが必ず`GHOST_OPACITY_FAR`になる。**
+オフセットを最大値だけで正規化すると、Spanが小さいときに両端が中央へ寄って階調が乏しくなる。
 @param off <number> そのゴーストのフレームオフセット。
-@param maxAbs <number> 正規化に使う、組の中で最大のオフセット。
+@param spread <Object> `ghostSpread()`が返した両端。
 @returns <Object> `{color: string, opacity: number}`適用する色と不透明度。
 */
-function ghostTone(off, maxAbs) {
-  const fade = 1 - (Math.abs(off) / (maxAbs + 1));
+function ghostTone(off, spread) {
+  const span = spread.max - spread.min;
+  // 距離が一種類しか無いなら割り付ける先が無いので、最も近いものとして扱う。
+  const t = span > 0 ? (spread.max - Math.abs(off)) / span : 1;
   return {
     color: document.getElementById(off < 0 ? "ghostPastColor" : "ghostFutureColor").value,
-    opacity: 0.12 + fade * 0.5
+    opacity: GHOST_OPACITY_FAR + (GHOST_OPACITY_NEAR - GHOST_OPACITY_FAR) * t
   };
 }
 
@@ -5088,27 +5184,47 @@ function ghostTone(off, maxAbs) {
 */
 function updateGhosts() {
   if (!ghostsEnabled() || !mixer || !clip) { clearGhosts(); return; }
-  const pairs = ghostBonePairs();
-  if (!pairs.length) { clearGhosts(); return; }
+  const points = ghostAsPoints();
+  /*
+  線は対ごとに2頂点、点はボーンごとに1頂点。
+  拾う対象そのものが変わるので、形式ごとに別の一覧を引く。
+  */
+  const nodes = points ? ghostBoneNodes() : ghostBonePairs();
+  if (!nodes.length) { clearGhosts(); return; }
 
+  const perItem = points ? 1 : 2;
   const offsets = ghostOffsets();
-  if (offsets.length !== ghosts.length) {
+  /*
+  頂点数と描画の種類が変わるとジオメトリを作り直すしかないので、本数だけでなく形式も見る。
+  */
+  const stale = offsets.length !== ghosts.length
+      || (ghosts.length && ghosts[0].isPoints !== points);
+  if (stale) {
     clearGhosts();
     offsets.forEach(() => {
       const geo = new THREE.BufferGeometry();
       geo.setAttribute("position",
-        new THREE.Float32BufferAttribute(new Float32Array(pairs.length * 6), 3));
-      const mat = new THREE.LineBasicMaterial({ transparent: true, depthWrite: false });
-      const line = new THREE.LineSegments(geo, mat);
-      line.frustumCulled = false;
-      scene.add(line);
-      ghosts.push(line);
+        new THREE.Float32BufferAttribute(new Float32Array(nodes.length * perItem * 3), 3));
+      /*
+      点の大きさは画面上で一定にする。
+      ワールド単位にすると、モデルの寸法とカメラの距離次第で見えなくなったり画面を覆ったりする。
+      */
+      const mat = points
+          ? new THREE.PointsMaterial({
+            size: ghostPointSize(), sizeAttenuation: false,
+            transparent: true, depthWrite: false
+          })
+          : new THREE.LineBasicMaterial({ transparent: true, depthWrite: false });
+      const obj = points ? new THREE.Points(geo, mat) : new THREE.LineSegments(geo, mat);
+      obj.frustumCulled = false;
+      scene.add(obj);
+      ghosts.push(obj);
     });
   }
   if (!ghosts.length) return;
 
   const restore = playhead;
-  const maxAbs = Math.max.apply(null, offsets.map((o) => Math.abs(o)).concat([1]));
+  const spread = ghostSpread(offsets);
   const v = new THREE.Vector3();
 
   offsets.forEach((off, gi) => {
@@ -5116,22 +5232,31 @@ function updateGhosts() {
     mixer.setTime(t);
     model.updateMatrixWorld(true);
 
-    const line = ghosts[gi];
-    const arr = line.geometry.getAttribute("position");
-    pairs.forEach((pair, i) => {
-      v.setFromMatrixPosition(pair[1].matrixWorld);
-      arr.setXYZ(i * 2, v.x, v.y, v.z);
-      v.setFromMatrixPosition(pair[0].matrixWorld);
-      arr.setXYZ(i * 2 + 1, v.x, v.y, v.z);
-    });
+    const obj = ghosts[gi];
+    const arr = obj.geometry.getAttribute("position");
+    if (points) {
+      nodes.forEach((bone, i) => {
+        v.setFromMatrixPosition(bone.matrixWorld);
+        arr.setXYZ(i, v.x, v.y, v.z);
+      });
+    }
+    else {
+      nodes.forEach((pair, i) => {
+        v.setFromMatrixPosition(pair[1].matrixWorld);
+        arr.setXYZ(i * 2, v.x, v.y, v.z);
+        v.setFromMatrixPosition(pair[0].matrixWorld);
+        arr.setXYZ(i * 2 + 1, v.x, v.y, v.z);
+      });
+    }
     arr.needsUpdate = true;
-    line.geometry.computeBoundingSphere();
+    obj.geometry.computeBoundingSphere();
 
-    const tone = ghostTone(off, maxAbs);
-    line.material.color.set(tone.color);
-    line.material.opacity = tone.opacity;
-    line.material.depthTest = !ghostOnTop();
-    line.renderOrder = ghostOrder();
+    const tone = ghostTone(off, spread);
+    obj.material.color.set(tone.color);
+    obj.material.opacity = tone.opacity;
+    obj.material.depthTest = !ghostOnTop();
+    if (points) obj.material.size = ghostPointSize();
+    obj.renderOrder = ghostOrder();
   });
 
   mixer.setTime(poseTime(restore)); // 生きているポーズへ戻す。
@@ -5147,6 +5272,7 @@ function refreshGhostsIfNeeded() {
             + `|${document.getElementById("ghostSpanInput").value}`
             + `|${document.getElementById("ghostStepInput").value}`
             + `|${document.getElementById("ghostDirSelect").value}`
+            + `|${document.getElementById("ghostStyleSelect").value}`
       : "off";
   if (key === lastGhostKey) return;
   lastGhostKey = key;
@@ -5326,6 +5452,10 @@ function clearCameraGhosts() {
     });
     g.line.dispose();
     g.fill.dispose();
+    if (g.dots) {
+      g.dots.geometry.dispose();
+      g.dots.material.dispose();
+    }
   });
   cameraGhosts = [];
 }
@@ -5347,7 +5477,10 @@ function updateCameraGhosts() {
   const offsets = ghostOffsets();
   if (!offsets.length) { clearCameraGhosts(); return; }
 
-  if (offsets.length !== cameraGhosts.length) {
+  const points = ghostAsPoints();
+  const stale = offsets.length !== cameraGhosts.length
+      || (cameraGhosts.length && cameraGhosts[0].points !== points);
+  if (stale) {
     clearCameraGhosts();
     offsets.forEach(() => {
       const line = new THREE.LineBasicMaterial({ transparent: true, depthWrite: false });
@@ -5357,35 +5490,61 @@ function updateCameraGhosts() {
       const group = new THREE.Group();
       group.frustumCulled = false;
       const parts = [];
-      cameraIcons.forEach(({ rig, icon: live }) => {
+      let dots = null;
+      if (points) {
         /*
-        錐台の形はリグの画角から決まるが、その画角はビューポートがそのカメラを覗いている間に書き換えられる。
-        ゲートフィットがレンダーアスペクトに対して計算し直し、焦点距離のアニメーションが毎フレーム動かす。
-        ここで組み直すと、ゴーストを有効にした瞬間の値が焼き込まれてしまう。
-        したがって生きているアイコンのジオメトリを共有し、ゴーストが常に書き出された形を持つようにする。
+        点で描くときは、カメラの位置と注視点だけを見せる。
+        錐台も注視線も引かないので、生きているアイコンとジオメトリを共有する必要がなく、
+        画角のアニメーションやゲートフィットの計算にも追随しなくてよい。
+        位置は`updateCameraGhostGizmos`が毎フレーム書き込む。
         */
-        const part = { rig, icon: new THREE.LineSegments(live.geometry, line),
-          marker: null, link: null };
-        part.icon.frustumCulled = false;
-        group.add(part.icon);
-        if (rig.userData.aimTarget) {
-          part.marker = buildAimMarker(0.175, line, fill);
-          group.add(part.marker);
-          const geo = new THREE.BufferGeometry();
-          geo.setAttribute("position", new THREE.Float32BufferAttribute(new Float32Array(6), 3));
-          part.link = new THREE.LineSegments(geo, line);
-          part.link.frustumCulled = false;
-          group.add(part.link);
-        }
-        parts.push(part);
-      });
+        const slots = cameraIcons.reduce(
+          (n, { rig }) => n + (rig.userData.aimTarget ? 2 : 1), 0);
+        const geo = new THREE.BufferGeometry();
+        geo.setAttribute("position",
+          new THREE.Float32BufferAttribute(new Float32Array(slots * 3), 3));
+        const mat = new THREE.PointsMaterial({
+          size: ghostPointSize(), sizeAttenuation: false,
+          transparent: true, depthWrite: false
+        });
+        dots = new THREE.Points(geo, mat);
+        dots.frustumCulled = false;
+        group.add(dots);
+        cameraIcons.forEach(({ rig }) => {
+          parts.push({ rig, icon: null, marker: null, link: null });
+        });
+      }
+      else {
+        cameraIcons.forEach(({ rig, icon: live }) => {
+          /*
+          錐台の形はリグの画角から決まるが、その画角はビューポートがそのカメラを覗いている間に書き換えられる。
+          ゲートフィットがレンダーアスペクトに対して計算し直し、焦点距離のアニメーションが毎フレーム動かす。
+          ここで組み直すと、ゴーストを有効にした瞬間の値が焼き込まれてしまう。
+          したがって生きているアイコンのジオメトリを共有し、ゴーストが常に書き出された形を持つようにする。
+          */
+          const part = { rig, icon: new THREE.LineSegments(live.geometry, line),
+            marker: null, link: null };
+          part.icon.frustumCulled = false;
+          group.add(part.icon);
+          if (rig.userData.aimTarget) {
+            part.marker = buildAimMarker(0.175, line, fill);
+            group.add(part.marker);
+            const geo = new THREE.BufferGeometry();
+            geo.setAttribute("position", new THREE.Float32BufferAttribute(new Float32Array(6), 3));
+            part.link = new THREE.LineSegments(geo, line);
+            part.link.frustumCulled = false;
+            group.add(part.link);
+          }
+          parts.push(part);
+        });
+      }
       scene.add(group);
-      cameraGhosts.push({ group, line, fill, parts });
+      cameraGhosts.push({ group, line, fill, parts, points, dots });
     });
   }
 
   const restore = playhead;
-  const maxAbs = Math.max.apply(null, offsets.map((o) => Math.abs(o)).concat([1]));
+  const spread = ghostSpread(offsets);
   const pos = new THREE.Vector3();
   const quat = new THREE.Quaternion();
   const scl = new THREE.Vector3();
@@ -5422,12 +5581,18 @@ function updateCameraGhosts() {
       part.quat = quat.clone();
     });
 
-    const tone = ghostTone(off, maxAbs);
+    const tone = ghostTone(off, spread);
     [ghost.line, ghost.fill].forEach((mat) => {
       mat.color.set(tone.color);
       mat.opacity = tone.opacity;
       mat.depthTest = !ghostOnTop();
     });
+    if (ghost.dots) {
+      ghost.dots.material.color.set(tone.color);
+      ghost.dots.material.opacity = tone.opacity;
+      ghost.dots.material.depthTest = !ghostOnTop();
+      ghost.dots.material.size = ghostPointSize();
+    }
     setRenderOrder(ghost.group, ghostOrder());
     ghost.group.visible = !usingFBXCamera;
   });
@@ -5446,6 +5611,24 @@ function updateCameraGhostGizmos() {
   const billboard = new THREE.Quaternion();
   activeCamera.getWorldQuaternion(billboard);
   cameraGhosts.forEach((ghost) => {
+    if (ghost.points) {
+      /*
+      点は錐台と違って向きも大きさも持たないので、拾った座標をそのまま頂点へ書く。
+      注視点を持つリグだけが2つ目の点を使うため、詰める位置は順に数える。
+      */
+      const arr = ghost.dots.geometry.getAttribute("position");
+      let i = 0;
+      ghost.parts.forEach((part) => {
+        if (!part.pos) return;
+        arr.setXYZ(i++, part.pos.x, part.pos.y, part.pos.z);
+        if (part.aim) arr.setXYZ(i++, part.aim.x, part.aim.y, part.aim.z);
+      });
+      arr.needsUpdate = true;
+      ghost.dots.geometry.setDrawRange(0, i);
+      ghost.dots.geometry.computeBoundingSphere();
+      ghost.group.updateMatrixWorld(true);
+      return;
+    }
     ghost.parts.forEach((part) => {
       if (!part.pos) return;
       part.icon.position.copy(part.pos);
@@ -7072,8 +7255,8 @@ document.getElementById("skelToggle").addEventListener("change", (e) => {
   lastGhostKey = "";
 });
 
-["ghostToggle", "ghostSpanInput", "ghostStepInput", "ghostDirSelect",
-  "camGhostToggle"].forEach((id) => {
+["ghostToggle", "ghostSpanInput", "ghostStepInput", "ghostDirSelect", "ghostStyleSelect",
+  "ghostPointSizeInput", "camGhostToggle"].forEach((id) => {
   document.getElementById(id).addEventListener("change", () => { lastGhostKey = ""; });
 });
 
@@ -7612,6 +7795,8 @@ function registerSettings() {
   persistControl("ghost.span", "ghostSpanInput", "ghostSpanResetBtn");
   persistControl("ghost.step", "ghostStepInput", "ghostStepResetBtn");
   persistControl("ghost.dir", "ghostDirSelect");
+  persistControl("ghost.style", "ghostStyleSelect");
+  persistControl("ghost.pointSize", "ghostPointSizeInput", "ghostPointSizeResetBtn");
   persistControl("ghost.onTop", "ghostOnTopToggle");
 
   persistControl("color.background", "bgColor", "bgResetBtn");
