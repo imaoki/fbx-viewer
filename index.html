@@ -1967,7 +1967,7 @@ watchIconFont();
 // -----------------------------------------------------------------------------
 
 /*- @var <string> アプリのバージョン（semver）。ここが唯一の出所。 */
-const APP_VERSION = "1.73.0";
+const APP_VERSION = "1.73.1";
 const APP_NAME = "FBX Viewer";
 document.getElementById("appVersion").textContent = APP_VERSION;
 document.getElementById("helpVersion").textContent = APP_VERSION;
@@ -4088,14 +4088,31 @@ function poseTime(t) {
   再生は実時間で進むので、通常ポーズはフレームの間で採られる。
   吸着はDCCのタイムラインが刻むように整数フレームへ量子化するもので、動きが決定的になり、Mayaと比較できるようになる。
   */
-  let v = t;
-  if (frameSnap && state.fps > 0) v = Math.round(v * state.fps) / state.fps;
+  const v = snapTime(t);
   const end = Math.max(clip.duration - 1e-4, 0);
   /*
   ここがファイル上の時刻とクリップ内の時刻の唯一の境目。
   負のフレームから始まるファイルは`alignClipsToStart()`でトラックを0起点へ寄せてあるので、同じ分だけ引いて渡す。
   */
   return THREE.MathUtils.clamp(v - clipStartTime, 0, end);
+}
+
+/*-
+ファイル上の時刻に吸着だけを掛ける。
+
+**クリップ内の時刻へは変換しない。**
+自前で解析したカーブ（可視性・ロール・焦点距離）はファイル上の時刻でキーを持っているので、
+`poseTime()`を通すと`clipStartTime`の分だけずれる。負のフレームから始まるファイルでは丸ごと食い違う。
+
+一方で吸着はミキサーへ渡すポーズと同じ刻みでなければならない。
+可視性はステップカーブなので、刻みが揃っていないと**切り替わる瞬間がポーズに対して最大で半フレームずれる**。
+焦点距離とロールは連続値なので飛びはしないが、フレームの間の中途半端な値が出る。
+どちらも再生中にだけ起きる。スクラブでは再生位置が整数フレームに乗るので差が出ない。
+@param t <number> ファイル上の時刻（秒）。
+@returns <number> 吸着後の時刻（秒）。吸着が無効ならそのまま。
+*/
+function snapTime(t) {
+  return frameSnap && state.fps > 0 ? Math.round(t * state.fps) / state.fps : t;
 }
 
 /*- ミキサーを進めずに、現在の再生位置でスケルトンをポーズさせる。 */
@@ -4390,7 +4407,8 @@ function meshShown(mesh) {
   if (mode !== "anim") return true;
   const rec = visRecords.get(mesh);
   if (!rec) return true;
-  return rec.base && rec.curves.every((c) => visibleAtStep(c, playhead));
+  const t = snapTime(playhead);
+  return rec.base && rec.curves.every((c) => visibleAtStep(c, t));
 }
 
 /*- 少なくとも1つのメッシュが可視性のキーに従っている間はtrue。 */
@@ -4606,7 +4624,7 @@ function rememberRollBase(rig) {
 function cameraRollDeg(rig, t) {
   const src = rig.userData.fbxSource;
   const curve = src && rollCurves.get(src.name);
-  if (curve) return sampleCurve(curve, t === undefined ? playhead : t);
+  if (curve) return sampleCurve(curve, snapTime(t === undefined ? playhead : t));
   const a = rig.userData.attrs;
   return (a && a.roll) || 0;
 }
@@ -6640,7 +6658,7 @@ function updateAnimatedFocal() {
     const src = rig.userData.fbxSource;
     const curve = src && focalCurves.get(src.name);
     if (!curve || !rig.userData.attrs) return;
-    const focal = sampleCurve(curve, playhead);
+    const focal = sampleCurve(curve, snapTime(playhead));
     if (Math.abs(focal - rig.userData.attrs.focalLength) < 1e-6) return;
     rig.userData.attrs.focalLength = focal;
     if (rig === activeCamera) prepareFBXCamera(rig);
