@@ -504,6 +504,13 @@ Googleのmotion_modeを黒地に載せたもの。線画のままだと明るい
     background: none;
     border-color: transparent;
   }
+  /* 記号ではなく文字を入れる小さなトグル。地の色が入切を示す。 */
+  .pair .icon-check .axis {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text);
+    padding: 0 2px;
+  }
   .pair .icon-check:has(input:checked) { background: var(--accent); }
   .pair .icon-check:focus-within { z-index: 1; }
   #viewBar .toggle span { font-size: 12px; }
@@ -869,6 +876,23 @@ Googleのmotion_modeを黒地に載せたもの。線画のままだと明るい
     width: 100px;
     text-align: left;
   }
+  /*
+  `appearance: base-select`は閉じているときの表示も本物の要素に置き換えるので、素の`<select>`と違って中身が折り返し、幅を超えてもはみ出す。
+  幅は上で固定してあるのだから、収まらない分は省略記号で切る。
+  内側の要素にも同じ指定が要る。外側だけでは、はみ出しが隠れるだけで省略記号が出ない。
+  */
+  aside select {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  aside select::selectedcontent {
+    display: block;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
   /* テイク名は長く、隣に場所を空けるべきラベルも無い。 */
   aside select.wide {
     flex: 1 1 auto;
@@ -1371,6 +1395,21 @@ Googleのmotion_modeを黒地に載せたもの。線画のままだと明るい
         <span class="label" style="flex:1 1 auto;" title="Seconds-to-frames conversion, detected from the file">fps</span>
         <input type="number" id="fpsInput" value="60" min="1" max="240" step="any" aria-label="fps">
       </div>
+      <details class="group" data-key="inPlace">
+        <summary><span class="ms chev">expand_more</span>In Place</summary>
+        <div class="row" style="align-items:center;flex-wrap:nowrap;">
+          <span class="label" style="flex:1 1 auto;" title="The object whose motion is cancelled">Motion Source</span>
+          <select id="inPlaceSourceSelect"></select>
+        </div>
+        <div class="row" style="align-items:center;flex-wrap:nowrap;">
+          <span class="label" style="flex:1 1 auto;" title="Which axes to cancel">Cancel Axes</span>
+          <div class="pair">
+            <label class="icon-check" title="Cancel X"><input type="checkbox" id="inPlaceXToggle"><span class="axis">X</span></label>
+            <label class="icon-check" title="Cancel Y"><input type="checkbox" id="inPlaceYToggle"><span class="axis">Y</span></label>
+            <label class="icon-check" title="Cancel Z"><input type="checkbox" id="inPlaceZToggle" checked><span class="axis">Z</span></label>
+          </div>
+        </div>
+      </details>
     </details>
 
     <details class="group" data-key="visibility">
@@ -1680,6 +1719,8 @@ Googleのmotion_modeを黒地に載せたもの。線画のままだと明るい
           <span class="ms">repeat</span></button>
         <label class="icon-check" title="Toggle Snap — whole frames instead of real time">
           <input type="checkbox" id="snapToggle" checked><span class="ms">floor</span></label>
+        <label class="icon-check" title="Toggle In Place — cancel one object's motion so a cycle plays on the spot">
+          <input type="checkbox" id="inPlaceToggle"><span class="ms">circle_circle</span></label>
       </div>
 
       <div class="tgroup tgroup-center">
@@ -1926,7 +1967,7 @@ watchIconFont();
 // -----------------------------------------------------------------------------
 
 /*- @var <string> アプリのバージョン（semver）。ここが唯一の出所。 */
-const APP_VERSION = "1.72.0";
+const APP_VERSION = "1.73.0";
 const APP_NAME = "FBX Viewer";
 document.getElementById("appVersion").textContent = APP_VERSION;
 document.getElementById("helpVersion").textContent = APP_VERSION;
@@ -2317,6 +2358,8 @@ let lastGhostKey = "";
 // ゴーストから外したジョイントの名前。名前で持つので、重複したBoneオブジェクトはまとめて効く。
 let ghostJointsOff = new Set();
 let ghostTreeOpen = new Set(); // 一覧で展開しているジョイントの名前。
+let inPlaceBase = new THREE.Vector3(); // モデルが読み込まれたときの位置。相殺はここからの差で加える。
+let inPlaceRef = null; // 基点オブジェクトの、基準フレームでの位置。
 
 // -----------------------------------------------------------------------------
 // モデル/アニメーションの状態
@@ -3579,6 +3622,8 @@ function loadFBX(buffer, name) {
 function onModelLoaded(obj, name) {
   model = obj;
   scene.add(model);
+  // 相殺はここからの差で加えるので、書き出された位置を控えておく。
+  inPlaceBase.copy(model.position);
 
   meshes = [];
   fbxCameras = [];
@@ -3609,6 +3654,13 @@ function onModelLoaded(obj, name) {
   buildFBXCameraRigs();
 
   skeletonHelper = new THREE.SkeletonHelper(model);
+  /*
+  **SkeletonHelperはバウンディングスフィアを一度しか計算しない。**
+  頂点はルート空間で毎フレーム書き換わるのに判定用の球は初期のまま残るので、
+  ボーンが遠くへ動くと視錐台の外と判定され、見えている位置にいるのにスケルトンが丸ごと消える。
+  毎フレーム球を計算し直すのは高くつくため、判定そのものを切る。
+  */
+  skeletonHelper.frustumCulled = false;
   skeletonHelper.renderOrder = ORDER_ON_TOP; // スケルトンは常に最前面。
   skeletonHelper.visible = document.getElementById("skelToggle").checked;
   scene.add(skeletonHelper);
@@ -3899,6 +3951,8 @@ function disposeModel() {
   ghostJointsOff = new Set();
   ghostTreeOpen = new Set();
   renderGhostJointList();
+  inPlaceRef = null;
+  inPlaceBase.set(0, 0, 0);
   if (model) {
     scene.remove(model);
     model.traverse((child) => {
@@ -3986,6 +4040,8 @@ function setTake(index) {
   updatePlayButton();
   updateRangeBand();
   applyPose();
+  renderInPlaceSources();
+  refreshInPlaceRef();
   updateReadout();
 }
 
@@ -5267,6 +5323,117 @@ function ghostCascadeEnabled() {
   return document.getElementById("ghostCascadeToggle").checked;
 }
 
+/*-
+ルートモーションの基点に選べるオブジェクト。移動のキーを持つものだけ。
+@returns <string[]> ノード名。トラックの出現順。
+*/
+function inPlaceCandidates() {
+  if (!clip) return [];
+  const out = [];
+  clip.tracks.forEach((t) => {
+    if (!t.name.endsWith(".position")) return;
+    const name = t.name.slice(0, -".position".length);
+    if (out.indexOf(name) < 0) out.push(name);
+  });
+  return out;
+}
+
+/*- その場歩きが有効なら`true`。 */
+function inPlaceEnabled() {
+  return document.getElementById("inPlaceToggle").checked && !!inPlaceSourceNode();
+}
+
+/*- 今選ばれている基点オブジェクト。 */
+function inPlaceSourceNode() {
+  if (!model) return null;
+  const name = document.getElementById("inPlaceSourceSelect").value;
+  return name ? (model.getObjectByName(name) || null) : null;
+}
+
+/*-
+基点オブジェクトの位置を、モデルの中の座標で読む。
+
+モデルには相殺のための移動しか加えないので、その分を引けば元の空間へ戻る。
+モデル自身が回転や拡縮を持っていても、**この関数の値どうしの差を取る限り**それらは打ち消し合うので影響しない。
+@param node <Object> 基点オブジェクト。
+@returns <THREE.Vector3> 位置。
+*/
+function inPlacePositionOf(node) {
+  node.updateWorldMatrix(true, false); // 祖先だけ更新する。全体を舐めるより軽い。
+  return new THREE.Vector3().setFromMatrixPosition(node.matrixWorld).sub(model.position);
+}
+
+/*-
+相殺の基準となる位置を、クリップの先頭フレームで測り直す。
+
+先頭を基準にすると、ループの初期位置にキャラクタが留まる。
+測るにはその時刻のポーズが要るので、ゴーストと同じくミキサーを一度動かして戻す。
+*/
+function refreshInPlaceRef() {
+  inPlaceRef = null;
+  const node = inPlaceSourceNode();
+  if (!node || !mixer || !clip) return;
+  model.position.copy(inPlaceBase);
+  mixer.setTime(poseTime(firstFrame() / state.fps));
+  inPlaceRef = inPlacePositionOf(node);
+  mixer.setTime(poseTime(playhead)); // 生きているポーズへ戻す。
+}
+
+/*-
+基点オブジェクトの移動を、モデル全体から差し引く。
+
+**個々のカーブを止めるのではなく、シーンをまとめてずらす。**
+そうしないと、武器のように別の階層へ分かれた要素が置き去りになり、本体との相対位置が崩れる。
+まとめてずらせば、どの要素も本体との関係を保ったまま、その場に留まる。
+
+軸ごとに切れるようにしてあるのは、上下だけは残したい場面があるため。
+歩きや走りは接地の上下動を持つが、それを消すと地面へめり込んだように見える。
+*/
+function applyInPlace() {
+  if (!model) return;
+  if (!inPlaceEnabled() || !inPlaceRef) {
+    if (!model.position.equals(inPlaceBase)) {
+      model.position.copy(inPlaceBase);
+      model.updateMatrixWorld(true);
+    }
+    return;
+  }
+  model.position.copy(inPlaceBase);
+  const now = inPlacePositionOf(inPlaceSourceNode()).sub(inPlaceRef);
+  model.position.set(
+    inPlaceBase.x - (document.getElementById("inPlaceXToggle").checked ? now.x : 0),
+    inPlaceBase.y - (document.getElementById("inPlaceYToggle").checked ? now.y : 0),
+    inPlaceBase.z - (document.getElementById("inPlaceZToggle").checked ? now.z : 0)
+  );
+  model.updateMatrixWorld(true);
+}
+
+/*- 基点に選べるオブジェクトの一覧を作り直す。 */
+function renderInPlaceSources() {
+  const sel = document.getElementById("inPlaceSourceSelect");
+  const prev = sel.value;
+  sel.innerHTML = "";
+  const names = inPlaceCandidates();
+  if (!names.length) {
+    const opt = document.createElement("option");
+    opt.textContent = "None";
+    opt.value = "";
+    sel.appendChild(opt);
+    sel.disabled = true;
+    return;
+  }
+  sel.disabled = false;
+  names.forEach((name) => {
+    const opt = document.createElement("option");
+    opt.value = name;
+    opt.textContent = name;
+    sel.appendChild(opt);
+  });
+  // 同じ名前が残っていれば選び直さない。似た構成のファイルを続けて開くときに選択が続く。
+  sel.value = names.indexOf(prev) >= 0 ? prev : names[0];
+  sel.title = sel.value; // 幅に収まらない名前は切られるので、全体はここで読めるようにする。
+}
+
 /*- ゴーストのジョイント一覧を描き直す。 */
 function renderGhostJointList() {
   const list = document.getElementById("ghostJointList");
@@ -5513,6 +5680,11 @@ function updateGhosts() {
   offsets.forEach((off, gi) => {
     const t = poseTime(restore + off / state.fps);
     mixer.setTime(t);
+    /*
+    相殺の量はフレームごとに違う。そのフレームの値で掛け直さないと、
+    今のフレームのずれ量で別のフレームの姿勢を置くことになり、ゴーストが流れて見える。
+    */
+    applyInPlace();
     model.updateMatrixWorld(true);
 
     const obj = ghosts[gi];
@@ -5543,6 +5715,7 @@ function updateGhosts() {
   });
 
   mixer.setTime(poseTime(restore)); // 生きているポーズへ戻す。
+  applyInPlace();
   model.updateMatrixWorld(true);
 }
 
@@ -6941,7 +7114,8 @@ function debugText() {
 /*- 再生コントロールを全て有効または無効にする（アニメーションが無いときに使う）。 */
 function setTransportEnabled(on) {
   [
-    "playBtn", "stepBackBtn", "stepFwdBtn", "goStartBtn", "goEndBtn", "playModeBtn", "snapToggle", "speedSelect",
+    "playBtn", "stepBackBtn", "stepFwdBtn", "goStartBtn", "goEndBtn", "playModeBtn", "snapToggle",
+    "inPlaceToggle", "speedSelect",
     // 今はフッターの外にあるので、.idleの規則ではこの二つが暗くならない。
     "takeSelect", "fpsInput",
     "rangeToggle", "setInBtn", "setOutBtn", "resetRangeBtn", "scrub"
@@ -7227,6 +7401,7 @@ function animate() {
 
   try {
     if (controls.enabled) controls.update();
+    applyInPlace(); // ポーズが決まった後に、シーンごとずらす。
     updateAnimatedFocal();
     if (visAnimated) applyMeshVisibility();
     updateAimCameras();
@@ -7533,6 +7708,16 @@ document.getElementById("shadedPresetSelect").addEventListener("change", (e) => 
 
 document.getElementById("meshAllBtn").addEventListener("click", () => setAllMeshesVisible(true));
 document.getElementById("meshNoneBtn").addEventListener("click", () => setAllMeshesVisible(false));
+["inPlaceToggle", "inPlaceSourceSelect", "inPlaceXToggle", "inPlaceYToggle", "inPlaceZToggle"]
+  .forEach((id) => {
+    document.getElementById(id).addEventListener("change", () => {
+      const sel = document.getElementById("inPlaceSourceSelect");
+      sel.title = sel.value;
+      refreshInPlaceRef();
+      applyInPlace();
+      refreshGhosts();
+    });
+  });
 document.getElementById("ghostJointAllBtn").addEventListener("click", () => setAllGhostJoints(true));
 document.getElementById("ghostJointNoneBtn").addEventListener("click", () => setAllGhostJoints(false));
 document.getElementById("skelToggle").addEventListener("change", (e) => {
@@ -8083,6 +8268,10 @@ function registerSettings() {
   persistControl("ghost.style", "ghostStyleSelect");
   persistControl("ghost.pointSize", "ghostPointSizeInput", "ghostPointSizeResetBtn");
   persistControl("ghost.cascade", "ghostCascadeToggle");
+  persistControl("anim.inPlace", "inPlaceToggle");
+  persistControl("anim.inPlaceX", "inPlaceXToggle");
+  persistControl("anim.inPlaceY", "inPlaceYToggle");
+  persistControl("anim.inPlaceZ", "inPlaceZToggle");
   persistControl("ghost.onTop", "ghostOnTopToggle");
 
   persistControl("color.background", "bgColor", "bgResetBtn");
